@@ -524,12 +524,11 @@ class ZORM:
         dim = len(self.x0)
         x = np.zeros((dim, self.T + 1))
         x[:, 0] = self.x0
-
+        if lower_bounds is None or upper_bounds is None:
+                    raise ValueError("Bounds must be provided when constraint_type is 'c'.")
         for k in range(self.T):
             new_x = self._step(x[:, k])
             if self.constraint_type == 'c':
-                if lower_bounds is None or upper_bounds is None:
-                    raise ValueError("Bounds must be provided when constraint_type is 'c'.")
                 new_x = self._feasible_projection(new_x, lower_bounds, upper_bounds)
             x[:, k + 1] = new_x
 
@@ -545,7 +544,8 @@ class Opt_min_CurvTime:
         Min Curv and Time optimizer.
 
         Parameters:
-        - func: The objective function to minimize.
+        - reftrack: reference track array containing the reference line and track widths [x, y, w_tr_right, w_tr_left].
+        - center: array containing the center line and track widths [x, y, w_tr_right, w_tr_left].
         - mu: Smoothing parameter for gradient approximation for ZO solver
         - h: Step size for ZO solver
         - iterations_ZO: number of iterations for ZO solver
@@ -558,10 +558,11 @@ class Opt_min_CurvTime:
         - max_s: maximum curv length
         - sigma: Initial covariance for CMA-es solver
         - popsize: population size for CMA-es solver
+        - iterations_CMA: number of iterations for ZORM solver
         - iterations_CMA: number of iterations for CMA-es solver
         - ggv_import_path: Path for importing ggv file
         - ax_max_machines_import_path: path for importing ax_max_machines file.
-        - fw: filter window lengths for onvolution (moving average) filtering of velocity profile
+        - fw: filter window lengths for convolution (moving average) filtering of velocity profile
         - m_veh: vehicle mass
         - drag_coeff: drag coefficient
         """
