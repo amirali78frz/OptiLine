@@ -6,7 +6,7 @@ Raceline Optimisation Toolkit.
 
 The full package manual is available here:
 
-➡️ [OptiLine Manual (PDF)](Docs/OptiLine_manual.pdf)
+➡️ [OptiLine Manual (PDF)](Docs/OptiLine_Manual.pdf)
 
 This document explains:
 
@@ -16,3 +16,4 @@ This document explains:
 - Solver algorithms
 - Usage examples
 - Track and GGV formats
+
