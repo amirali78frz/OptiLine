@@ -3,6 +3,45 @@ import math
 from OptiLine.utils import calc_splines, conv_filt
 from scipy.interpolate import splprep, splev
 
+try:
+    from numba import njit as _njit
+except ImportError:
+    def _njit(fn=None, **_):             # transparent no-op fallback
+        return fn if fn is not None else lambda f: f
+
+
+# mode_int encoding: 0 = accel_forw, 1 = decel_forw, 2 = decel_backw
+@_njit(cache=True)
+def _calc_ax_poss_nb(vx_start, radius,
+                     ggv_vx, ggv_ax, ggv_ay,
+                     ax_mach_vx, ax_mach_ax,
+                     mu, dyn_model_exp, drag_coeff, m_veh,
+                     mode_int):
+    ax_max_tires = mu * np.interp(vx_start, ggv_vx, ggv_ax)
+    ay_max_tires = mu * np.interp(vx_start, ggv_vx, ggv_ay)
+    ay_used = vx_start * vx_start / radius
+
+    if mode_int != 1 and ax_max_tires < 0.0:   # accel_forw or decel_backw
+        ax_max_tires = -ax_max_tires
+    elif mode_int == 1 and ax_max_tires > 0.0:  # decel_forw
+        ax_max_tires = -ax_max_tires
+
+    radicand = 1.0 - (ay_used / ay_max_tires) ** dyn_model_exp
+    ax_avail_tires = ax_max_tires * radicand ** (1.0 / dyn_model_exp) if radicand > 0.0 else 0.0
+
+    if mode_int == 0:   # accel_forw — apply motor limits
+        ax_mach_tmp = np.interp(vx_start, ax_mach_vx, ax_mach_ax)
+        ax_avail = ax_avail_tires if ax_avail_tires < ax_mach_tmp else ax_mach_tmp
+    else:
+        ax_avail = ax_avail_tires
+
+    ax_drag = -(vx_start * vx_start) * drag_coeff / m_veh
+
+    if mode_int != 2:   # accel_forw or decel_forw
+        return ax_avail + ax_drag
+    else:               # decel_backw
+        return ax_avail - ax_drag
+
 def calc_vel_profile(ax_max_machines: np.ndarray,
                      kappa: np.ndarray,
                      el_lengths: np.ndarray,
@@ -16,7 +55,8 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
                      mu: np.ndarray = None,
                      v_start: float = None,
                      v_end: float = None,
-                     filt_window: int = None) -> np.ndarray:
+                     filt_window: int = None,
+                     p_ggv: np.ndarray = None) -> np.ndarray:
     """
 
     .. description::
@@ -154,9 +194,10 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
     where the first dimension is the waypoint, the second is the velocity and the third is the two acceleration columns
     -> DIM = NO_WAYPOINTS_CLOSED x NO_VELOCITY ENTRIES x 3"""
 
-    # CASE 1: ggv supplied -> copy it for every waypoint
+    # CASE 1: ggv supplied -> copy it for every waypoint (skip if pre-built p_ggv provided)
     if ggv is not None:
-        p_ggv = np.repeat(np.expand_dims(ggv, axis=0), kappa.size, axis=0)
+        if p_ggv is None or p_ggv.shape[0] != kappa.size:
+            p_ggv = np.repeat(np.expand_dims(ggv, axis=0), kappa.size, axis=0)
         op_mode = 'ggv'
 
     # CASE 2: local gg diagram supplied -> add velocity dimension (artificial velocity of 10.0 m/s)
@@ -389,7 +430,7 @@ def __solver_fb_closed(p_ggv: np.ndarray,
         # iterate until the initial velocity profile converges (break after max. 100 iterations)
         converged = False
 
-        for i in range(100):
+        for i in range(10):
             vx_profile_prev_iteration = vx_profile
 
             ay_max_curr = mu * np.interp(vx_profile, p_ggv[0, :, 0], p_ggv[0, :, 2])
@@ -411,46 +452,65 @@ def __solver_fb_closed(p_ggv: np.ndarray,
     # cut vx_profile to car's top speed
     vx_profile[vx_profile > v_max] = v_max
 
-    """We need to calculate the speed profile for two laps to get the correct starting and ending velocity."""
+    """We need to calculate the speed profile for three laps and keep the middle lap.
 
-    # double arrays
-    vx_profile_double = np.concatenate((vx_profile, vx_profile), axis=0)
-    radii_double = np.concatenate((radii, radii), axis=0)
-    el_lengths_double = np.concatenate((el_lengths, el_lengths), axis=0)
-    mu_double = np.concatenate((mu, mu), axis=0)
-    p_ggv_double = np.concatenate((p_ggv, p_ggv), axis=0)
+    Why 3 laps, not 2:
+    The backward pass is implemented by *flipping* the array and running the same forward
+    algorithm.  The forward algorithm only ever writes vx_profile[i+1] — it never touches
+    vx_profile[0] (index 0 of the flipped array = vx[-1] of the original).
 
-    # calculate acceleration profile
-    vx_profile_double = __solver_fb_acc_profile(p_ggv=p_ggv_double,
+    With 2-lap doubling the flipped array has size 2*N.  vx[-1] of the second copy sits at
+    flipped[0] and is therefore *never* constrained by the backward pass, regardless of
+    how many iterations you run.  The car's speed at the end of the lap is never forced to
+    account for the braking needed to enter the next lap's corner — so vx[-1] stays too
+    high and the appended wrap-around acceleration ax = (vx[0]²-vx[-1]²)/(2*ds) comes out
+    at -36 m/s².
+
+    With 3 laps the flipped array has size 3*N.  In the flipped representation the corner
+    at the start of the third copy sits at flipped[N-1] (= vx[0] of the third copy =
+    the slow-corner speed, e.g. 15 m/s).  That creates an acceleration phase at index
+    N-1 → N, so the forward-on-flipped algorithm constrains flipped[N] = vx[-1] of the
+    middle (second) copy to the physically correct braking distance from the corner.
+    After flipping back, result[2*N-1] = vx[-1] of the middle lap is correctly limited. ✓
+    """
+
+    # Triple the track arrays (fixed for both passes)
+    radii_triple      = np.concatenate((radii,      radii,      radii),      axis=0)
+    el_lengths_triple = np.concatenate((el_lengths, el_lengths, el_lengths), axis=0)
+    mu_triple         = np.concatenate((mu,         mu,         mu),         axis=0)
+    p_ggv_triple      = np.concatenate((p_ggv,      p_ggv,      p_ggv),      axis=0)
+
+    # --- forward (acceleration) pass on 3 laps; keep middle lap ---
+    vx_profile_triple = np.concatenate((vx_profile, vx_profile, vx_profile), axis=0)
+    vx_profile_triple = __solver_fb_acc_profile(p_ggv=p_ggv_triple,
                                                 ax_max_machines=ax_max_machines,
                                                 v_max=v_max,
-                                                radii=radii_double,
-                                                el_lengths=el_lengths_double,
-                                                mu=mu_double,
-                                                vx_profile=vx_profile_double,
+                                                radii=radii_triple,
+                                                el_lengths=el_lengths_triple,
+                                                mu=mu_triple,
+                                                vx_profile=vx_profile_triple,
                                                 backwards=False,
                                                 dyn_model_exp=dyn_model_exp,
                                                 drag_coeff=drag_coeff,
                                                 m_veh=m_veh)
+    vx_profile = vx_profile_triple[no_points:2 * no_points]   # middle lap
 
-    # use second lap of acceleration profile
-    vx_profile_double = np.concatenate((vx_profile_double[no_points:], vx_profile_double[no_points:]), axis=0)
-
-    # calculate deceleration profile
-    vx_profile_double = __solver_fb_acc_profile(p_ggv=p_ggv_double,
+    # --- backward (deceleration) pass on 3 laps; keep middle lap ---
+    # vx[-1] of the middle lap is now at flipped[N] (not flipped[0]) and IS
+    # constrained by the acceleration phase that starts at flipped[N-1] = vx[0] corner.
+    vx_profile_triple = np.concatenate((vx_profile, vx_profile, vx_profile), axis=0)
+    vx_profile_triple = __solver_fb_acc_profile(p_ggv=p_ggv_triple,
                                                 ax_max_machines=ax_max_machines,
                                                 v_max=v_max,
-                                                radii=radii_double,
-                                                el_lengths=el_lengths_double,
-                                                mu=mu_double,
-                                                vx_profile=vx_profile_double,
+                                                radii=radii_triple,
+                                                el_lengths=el_lengths_triple,
+                                                mu=mu_triple,
+                                                vx_profile=vx_profile_triple,
                                                 backwards=True,
                                                 dyn_model_exp=dyn_model_exp,
                                                 drag_coeff=drag_coeff,
                                                 m_veh=m_veh)
-
-    # use second lap of deceleration profile
-    vx_profile = vx_profile_double[no_points:]
+    vx_profile = vx_profile_triple[no_points:2 * no_points]   # middle lap
 
     return vx_profile
 
@@ -513,12 +573,15 @@ def __solver_fb_acc_profile(p_ggv: np.ndarray,
         el_lengths_mod = np.flipud(el_lengths)
         mu_mod = np.flipud(mu)
         vx_profile = np.flipud(vx_profile)
-        mode = 'decel_backw'
     else:
         radii_mod = radii
         el_lengths_mod = el_lengths
         mu_mod = mu
-        mode = 'accel_forw'
+
+    # Pre-extract constant arrays and mode integer for the numba kernel
+    mode_int = 2 if backwards else 0    # 0 = accel_forw, 2 = decel_backw
+    ax_mach_vx = ax_max_machines[:, 0]
+    ax_mach_ax = ax_max_machines[:, 1]
 
     # ------------------------------------------------------------------------------------------------------------------
     # SEARCH START POINTS FOR ACCELERATION PHASES ----------------------------------------------------------------------
@@ -549,15 +612,11 @@ def __solver_fb_acc_profile(p_ggv: np.ndarray,
         # start from current index and run until either the end of the lap or a termination criterion are reached
         while i < no_points - 1:
 
-            ax_possible_cur = calc_ax_poss(vx_start=vx_profile[i],
-                                           radius=radii_mod[i],
-                                           ggv=p_ggv[i],
-                                           ax_max_machines=ax_max_machines,
-                                           mu=mu_mod[i],
-                                           mode=mode,
-                                           dyn_model_exp=dyn_model_exp,
-                                           drag_coeff=drag_coeff,
-                                           m_veh=m_veh)
+            ax_possible_cur = _calc_ax_poss_nb(
+                float(vx_profile[i]), float(radii_mod[i]),
+                p_ggv[i, :, 0], p_ggv[i, :, 1], p_ggv[i, :, 2],
+                ax_mach_vx, ax_mach_ax,
+                float(mu_mod[i]), dyn_model_exp, drag_coeff, m_veh, mode_int)
 
             vx_possible_next = math.sqrt(math.pow(vx_profile[i], 2) + 2 * ax_possible_cur * el_lengths_mod[i])
 
@@ -572,15 +631,11 @@ def __solver_fb_acc_profile(p_ggv: np.ndarray,
 
                 # looping just once at the moment
                 for j in range(1):
-                    ax_possible_next = calc_ax_poss(vx_start=vx_possible_next,
-                                                    radius=radii_mod[i + 1],
-                                                    ggv=p_ggv[i + 1],
-                                                    ax_max_machines=ax_max_machines,
-                                                    mu=mu_mod[i + 1],
-                                                    mode=mode,
-                                                    dyn_model_exp=dyn_model_exp,
-                                                    drag_coeff=drag_coeff,
-                                                    m_veh=m_veh)
+                    ax_possible_next = _calc_ax_poss_nb(
+                        float(vx_possible_next), float(radii_mod[i + 1]),
+                        p_ggv[i + 1, :, 0], p_ggv[i + 1, :, 1], p_ggv[i + 1, :, 2],
+                        ax_mach_vx, ax_mach_ax,
+                        float(mu_mod[i + 1]), dyn_model_exp, drag_coeff, m_veh, mode_int)
 
                     vx_tmp = math.sqrt(math.pow(vx_profile[i], 2) + 2 * ax_possible_next * el_lengths_mod[i])
 

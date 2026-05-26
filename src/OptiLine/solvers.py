@@ -25,7 +25,7 @@ def opt_min_curv(reftrack: np.ndarray,
     the heading psi_s and psi_e is enforced on the first and last point of the reftrack. Furthermore, in case of an
     unclosed track, the first and last point of the reftrack are not subject to optimization and stay same.
 
-    Please refer to our paper for further information:
+    Please refer to the paper for further information:
     Heilmeier, Wischnewski, Hermansdorfer, Betz, Lienkamp, Lohmann
     Minimum Curvature Trajectory Planning and Control for an Autonomous Racecar
     DOI: 10.1080/00423114.2019.1631455
@@ -465,7 +465,7 @@ class ConstrainedCMAES_t:
 
 
 class ZORM:
-    def __init__(self, func, x0, num_iterations, mu=0.05, h=0.001, grad_type='noth', constraint_type='notc'):
+    def __init__(self, func, x0, num_iterations, mu=0.05, h=0.001, t=1, grad_type='noth', constraint_type='notc'):
         """
         ZORM optimizer.
 
@@ -475,6 +475,7 @@ class ZORM:
         - h: Step size.
         - x0: initial guess
         - num_iterations: number of iterations
+        - t: number of sampled directions for gradient estimation (averaged).
         - grad_type: 'noth' for forward gradient, 'h' for symmetric (central difference).
         - constraint_type: 'notc' for unconstrained, 'c' for constrained optimization.
         """
@@ -483,6 +484,7 @@ class ZORM:
         self.h = h
         self.x0=x0
         self.T = num_iterations
+        self.t = t
         self.grad_type = grad_type
         self.constraint_type = constraint_type
 
@@ -494,15 +496,19 @@ class ZORM:
         return y
 
     def _grad(self, x):
-        u = self._sample_gaussian(len(x))
-        perturbation = self.mu * u
-        if self.grad_type == 'noth':
-            g = (self.func(x + perturbation) - self.func(x)) / self.mu
-        elif self.grad_type == 'h':
-            g = (self.func(x + perturbation) - self.func(x - perturbation)) / (2 * self.mu)
-        else:
-            raise ValueError("Invalid gradient type. Use 'noth' or 'h'.")
-        return g * u
+        grad_sum = np.zeros(len(x))
+        fx = self.func(x)
+        for _ in range(self.t):
+            u = self._sample_gaussian(len(x))
+            perturbation = self.mu * u
+            if self.grad_type == 'noth':
+                g = (self.func(x + perturbation) - fx) / self.mu
+            elif self.grad_type == 'h':
+                g = (self.func(x + perturbation) - self.func(x - perturbation)) / (2 * self.mu)
+            else:
+                raise ValueError("Invalid gradient type. Use 'noth' or 'h'.")
+            grad_sum += g * u
+        return grad_sum / self.t
 
     def _step(self, x):
         grad_est = self._grad(x)
@@ -538,8 +544,11 @@ from OptiLine.utils import calc_splines,create_raceline, calc_head_curv_an, H_f,
 from OptiLine.KinematicProfs import calc_vel_profile, calc_ax_profile, calc_t_profile , cumulative_distances
 
 class Opt_min_CurvTime:
-    def __init__(self, reftrack,center, mu=0.05, h=0.001, kapb = 0.7, sfty = 1, si = 0.8, vm = 22.88, m_veh = 3, drag_coeff =0.0045,  MC = 1, min_s =0.02 , max_s=0.4, sigma = 0.001,\
-                  iterations_ZO= 300, iterations_CMA=30, popsize = 16  ,ggv_import_path="maps/ggv.csv",ax_max_machines_import_path="maps/ax_max_machines.csv",fw=3):
+    def __init__(self, reftrack, center, mu=0.05, h=0.001, kapb=0.7, sfty=1, t=1, si=0.8,
+                 vm=22.88, m_veh=3, drag_coeff=0.0045, MC=1, min_s=None, max_s=None, sigma=0.001,
+                 iterations_ZO=300, iterations_CMA=30, popsize=16,
+                 ggv_import_path="maps/ggv.csv", ax_max_machines_import_path="maps/ax_max_machines.csv",
+                 fw=3, refine_every=None, refine_subsample=1):
         """
         Min Curv and Time optimizer.
 
@@ -550,6 +559,7 @@ class Opt_min_CurvTime:
         - h: Step size for ZO solver
         - iterations_ZO: number of iterations for ZO solver
         - sfty: half of the vehicle width
+        - t = number of sampled directions for gradient estimation (averaged) for ZO solver
         - kapb = bound on the maximum allowed curvature
         - si: interpolation step size of the race line
         - vm: maximum available velocity
@@ -565,10 +575,23 @@ class Opt_min_CurvTime:
         - fw: filter window lengths for convolution (moving average) filtering of velocity profile
         - m_veh: vehicle mass
         - drag_coeff: drag coefficient
+        - refine_every: int or None.  When set to a positive integer q, CurveLenOpt rebuilds the
+                        reference track from the current optimised raceline every q ZO iterations.
+                        None (default) disables refinement and preserves the original behaviour.
+                        Call reset() to restore self.reftrack to the original track at any time.
+        - refine_subsample: int.  Sub-sampling stride applied to the new raceline before it
+                        becomes the refined reference track.  1 = no sub-sampling (default).
         """
+
+        if min_s is None and max_s is None:
+            el_lengths = np.sqrt(np.sum(np.power(np.diff(np.vstack((reftrack[:, 0:2], reftrack[0, 0:2])), axis=0), 2), axis=1))
+            min_s = np.min(el_lengths) *1
+            max_s = np.max(el_lengths) *1.7
+
         self.reftrack = reftrack
         self.mu = mu
         self.h = h
+        self.t = t
         self.ggv_import_path = ggv_import_path
         self.ax_max_machines_import_path = ax_max_machines_import_path
         self.sfty = sfty
@@ -590,12 +613,175 @@ class Opt_min_CurvTime:
         lengths=np.append(lengths, lengths[0])
         self.lengths=lengths
         self.ggv,self.ax_max_machines =import_veh_dyn_info(ggv_import_path=self.ggv_import_path,ax_max_machines_import_path=self.ax_max_machines_import_path)
+        # Pre-built p_ggv cache keyed by kappa array size (size is approx constant across f_t calls)
+        self._p_ggv_cache = {}
+
+        # Refinement settings
+        self.refine_every = refine_every
+        self.refine_subsample = int(refine_subsample)
+        # Immutable copy of the original track; used by reset() and _build_refined_reftrack()
+        self._base_reftrack = reftrack.copy()
 
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((center[:, 0:2], center[0, 0:2])),use_dist_scaling=True)
         
         self.bound1 = center[:, 0:2] - normvec_norm * np.expand_dims(center[:, 2], axis=1)
         self.bound2 = center[:, 0:2] + normvec_norm * np.expand_dims(center[:, 3], axis=1)
 
+
+    # ------------------------------------------------------------------
+    # Public helper
+    # ------------------------------------------------------------------
+
+    def reset(self):
+        """
+        .. description::
+        Restore self.reftrack to the original reference track supplied at construction
+        time, reverting any in-place refinements made during CurveLenOpt.
+        """
+        self._update_reftrack(self._base_reftrack.copy())
+
+    # ------------------------------------------------------------------
+    # Private helpers for path refinement
+    # ------------------------------------------------------------------
+
+    def _update_reftrack(self, reftrack_new: np.ndarray) -> None:
+        """
+        .. description::
+        Replace self.reftrack with reftrack_new and recompute all derived quantities:
+        segment lengths, optimisation bounds (min_s / max_s), and the p_ggv cache.
+
+        .. inputs::
+        :param reftrack_new:    new reference track [x, y, w_right, w_left].
+        :type reftrack_new:     np.ndarray
+        """
+        self.reftrack = reftrack_new
+        lengths = np.sqrt(np.sum(
+            np.power(np.diff(reftrack_new[:, 0:2], axis=0), 2), axis=1))
+        lengths = np.append(lengths, lengths[0])
+        self.lengths = lengths
+        self.min_s = float(np.min(lengths))
+        self.max_s = float(np.max(lengths)) * 1.7
+        self._p_ggv_cache = {}   # kappa size may have changed — invalidate
+
+    def _build_refined_reftrack(self,
+                                alpha_m: np.ndarray,
+                                normvec_norm: np.ndarray) -> np.ndarray:
+        """
+        .. description::
+        Build a geometrically correct refined reference track from the QP solution on
+        the CURRENT self.reftrack.
+
+        The new centreline is the set of control points shifted laterally by alpha_m
+        along their unit normal vectors.  The track half-widths are adjusted so that
+        the two physical boundary lines stay EXACTLY in place:
+
+            new_w_col2[i] = w_col2[i] + alpha_m[i]
+            new_w_col3[i] = w_col3[i] − alpha_m[i]
+
+        Derivation (QP constraint boundaries preserved):
+            The QP constraint is  −(w_col3 − sfty) ≤ α ≤ (w_col2 − sfty),
+            so positive α moves the car toward  B_A = center + n · w_col2
+            and negative α moves it toward      B_B = center − n · w_col3.
+
+            After the shift, the remaining distances to each boundary are:
+                room toward B_A: w_col2 − alpha   (moved closer → less room)
+                room toward B_B: w_col3 + alpha   (moved away  → more room)
+
+            From the new center the next-pass optimizer can reach at most:
+                new_center + (new_w_col2 − sfty)·n
+                    = (center + alpha·n) + (w_col2 − alpha − sfty)·n
+                    = center + (w_col2 − sfty)·n                          ✓
+                new_center − (new_w_col3 − sfty)·n
+                    = (center + alpha·n) − (w_col3 + alpha − sfty)·n
+                    = center − (w_col3 − sfty)·n                          ✓
+            i.e. the optimizer is confined to exactly the same physical region
+            as in the original pass, regardless of how many refinement steps
+            have been taken.
+
+        A minimum clearance of self.sfty is enforced on both sides so widths can
+        never fall below the vehicle half-width.  The optional sub-sampling stride
+        self.refine_subsample is applied before returning.
+
+        .. inputs::
+        :param alpha_m:         lateral shifts in m at every control point, shape (N,).
+        :type alpha_m:          np.ndarray
+        :param normvec_norm:    unit normal vectors at every control point, shape (N, 2).
+        :type normvec_norm:     np.ndarray
+
+        .. outputs::
+        :return reftrack_new:   refined reference track [x, y, w_col2, w_col3].
+        :rtype reftrack_new:    np.ndarray
+        """
+        new_xy  = self.reftrack[:, :2] + alpha_m[:, np.newaxis] * normvec_norm
+        new_w2  = self.reftrack[:, 2] - alpha_m
+        new_w3  = self.reftrack[:, 3] + alpha_m
+
+        reftrack_new = np.column_stack([new_xy, new_w2, new_w3])
+
+        # step = int(self.refine_subsample)
+        # if step > 1:
+        #     nn  = reftrack_new.shape[0]
+        #     idx = np.arange(0, nn, step)
+        #     idx = np.unique(np.concatenate([idx, [nn - 1]]))
+        #     reftrack_new = reftrack_new[idx]
+
+        return reftrack_new
+
+    def _solve_alpha(self, ds: np.ndarray):
+        """
+        .. description::
+        Solve the minimum-curvature QP on self.reftrack for the given segment lengths
+        and return the lateral shift vector alpha_m together with the normal vectors.
+        Both arrays are at CONTROL-POINT resolution (one entry per track point), which
+        is what _build_refined_reftrack needs to compute physically correct widths.
+
+        .. inputs::
+        :param ds:  spline segment lengths for the current reference track, shape (N,).
+        :type ds:   np.ndarray
+
+        .. outputs::
+        :return alpha_m:        lateral shift at every control point in m, shape (N,).
+        :rtype alpha_m:         np.ndarray
+        :return normvec_norm:   unit normal vectors at every control point, shape (N, 2).
+        :rtype normvec_norm:    np.ndarray
+        """
+        coeffs_x, coeffs_y, M_mat, normvec_norm = calc_splines(
+            path=np.vstack((self.reftrack[:, 0:2], self.reftrack[0, 0:2])),
+            el_lengths=ds)
+        H, f, G, h = H_f(
+            reftrack=self.reftrack,
+            normvectors=normvec_norm,
+            A=M_mat,
+            kappa_bound=self.kapb,
+            w_veh=self.sfty,
+            closed=True)
+        alpha_m = quadprog.solve_qp(H, -f, -G.T, -h, 0)[0]
+        return alpha_m, normvec_norm
+
+    def _extract_raceline(self, ds: np.ndarray) -> np.ndarray:
+        """
+        .. description::
+        Convenience method: solve the QP and return the DENSE interpolated raceline
+        (one point every self.si metres).  Useful for external inspection or plotting.
+        Refinement internally uses _solve_alpha + _build_refined_reftrack instead.
+
+        .. inputs::
+        :param ds:  spline segment lengths for the current reference track, shape (N,).
+        :type ds:   np.ndarray
+
+        .. outputs::
+        :return raceline_interp:    interpolated raceline [x, y], shape (M, 2).
+        :rtype raceline_interp:     np.ndarray
+        """
+        alpha_m, normvec_norm = self._solve_alpha(ds)
+        raceline_interp, *_ = create_raceline(
+            refline=self.reftrack[:, :2],
+            normvectors=normvec_norm,
+            alpha=alpha_m,
+            stepsize_interp=self.si)
+        return raceline_interp
+
+    # ------------------------------------------------------------------
 
     def f_t(self,ds):
         """
@@ -643,6 +829,9 @@ class Opt_min_CurvTime:
 
         vm =self.vm
         fw = 3
+        n = kappa_opt.size
+        if n not in self._p_ggv_cache:
+            self._p_ggv_cache[n] = np.repeat(np.expand_dims(self.ggv, axis=0), n, axis=0)
         vx_profile_opt = calc_vel_profile(ggv=self.ggv,
                                 ax_max_machines=self.ax_max_machines,
                                 v_max=vm,
@@ -653,7 +842,8 @@ class Opt_min_CurvTime:
                                 dyn_model_exp=1.0,
                                 drag_coeff=self.drag_coeff,
                                 m_veh=self.m_veh,
-                                v_start = 0.0)
+                                v_start = 0.0,
+                                p_ggv=self._p_ggv_cache[n])
 
         # calculate longitudinal acceleration profile
         vx_profile_opt_cl = np.append(vx_profile_opt, vx_profile_opt[0])
@@ -668,57 +858,185 @@ class Opt_min_CurvTime:
         
         return t_profile_cl[-1]
     
-    def CurveLenOpt(self,solver='ZO'):
+    def CurveLenOpt(self, solver='ZO', refine_every=None):
         """
 
         .. description::
-        Optimizes the spline segment lengths of the reference track to minimize lap time. Supports two solvers:
-        zeroth-order random method (ZO) and CMA-ES (CMA). Monte Carlo averaging is applied over self.MC runs.
+        Optimizes the spline segment lengths of the reference track to minimize lap time.
+        Supports two solvers: zeroth-order random method (ZO) and CMA-ES (CMA).
+        Monte Carlo averaging is applied over self.MC runs when refinement is disabled.
+
+        When refine_every is set to a positive integer q the ZO loop is split into blocks
+        of q iterations.  After each block (except the last) the current optimised raceline
+        is extracted, the reference track is rebuilt from that raceline via
+        _build_refined_reftrack, and optimisation continues on the refined track.
+        This updates self.reftrack as a side-effect; call reset() to restore the original.
 
         .. inputs::
-        :param solver:      optimization solver to use. 'ZO' for zeroth-order random method, 'CMA' for CMA-ES.
-        :type solver:       str
+        :param solver:          optimization solver to use. 'ZO' for zeroth-order random
+                                method, 'CMA' for CMA-ES.
+        :type solver:           str
+        :param refine_every:    per-call override for self.refine_every.  Positive integer q
+                                enables refinement every q iterations; 0 or None disables it.
+        :type refine_every:     int or None
 
         .. outputs::
-        :return ds_ff:      optimized array of spline segment lengths averaged over Monte Carlo runs.
-        :rtype ds_ff:       np.ndarray
+        :return ds_ff:          optimized array of spline segment lengths for the current
+                                self.reftrack (may be a refined track when refinement is used).
+        :rtype ds_ff:           np.ndarray
         """
 
+        # Resolve effective refinement cadence (per-call overrides instance default)
+        q = refine_every if refine_every is not None else self.refine_every
+        use_refinement = (q is not None and int(q) > 0)
+
         if solver == 'ZO':
-            ds_0 = self.lengths
-            ds_ff = np.zeros_like(ds_0)
-            for i in range(self.MC):
-                ZOs = ZORM(self.f_t, ds_0, self.iterations_ZO, mu=self.mu, h=self.h, constraint_type='c')
-                ds = ZOs.optimize(lower_bounds=self.min_s,upper_bounds=self.max_s)
-                ds_ff += ds[:,-1]
-            ds_ff=ds_ff/self.MC
-            return ds_ff
+            ds_0 = self.lengths.copy()
+
+            if not use_refinement:
+                # ----------------------------------------------------------------
+                # Original behaviour: MC runs, no path refinement
+                # ----------------------------------------------------------------
+                ds_ff = np.zeros_like(ds_0)
+                for _ in range(self.MC):
+                    ZOs = ZORM(self.f_t, ds_0, self.iterations_ZO,
+                               mu=self.mu, h=self.h, t=self.t, constraint_type='c')
+                    ds = ZOs.optimize(lower_bounds=self.min_s, upper_bounds=self.max_s)
+                    ds_ff += ds[:, -1]
+                return ds_ff / self.MC
+
+            else:
+                # ----------------------------------------------------------------
+                # Refinement-aware loop
+                # ----------------------------------------------------------------
+                if self.MC > 1:
+                    print("WARNING [CurveLenOpt]: MC > 1 is not supported with path "
+                          "refinement; running a single pass (MC=1).")
+
+                q = int(q)
+                if q > self.iterations_ZO:
+                    print(f"WARNING [CurveLenOpt]: refine_every ({q}) > iterations_ZO "
+                          f"({self.iterations_ZO}). No refinement will occur.")
+
+                # Partition total iterations into blocks of q (last block may be shorter).
+                # Refinement happens BETWEEN blocks, NOT after the final block, so we
+                # always end with an optimised ds on the current self.reftrack.
+                n_full = self.iterations_ZO // q
+                rem    = self.iterations_ZO % q
+                all_blocks = [q] * n_full
+                if rem > 0:
+                    all_blocks.append(rem)
+                n_blocks = len(all_blocks)
+                n_refinements = n_blocks - 1   # refine between every pair of blocks
+
+                ds_current = self.lengths.copy()
+
+                for blk_idx, blk_iters in enumerate(all_blocks):
+                    ZOs = ZORM(self.f_t, ds_current, blk_iters,
+                               mu=self.mu, h=self.h, t=self.t, constraint_type='c')
+                    ds_opt = ZOs.optimize(
+                        lower_bounds=self.min_s, upper_bounds=self.max_s)[:, -1]
+
+                    is_last = (blk_idx == n_blocks - 1)
+
+                    if not is_last:
+                        # Solve QP → exact alpha + normals → geometrically correct reftrack
+                        alpha_m, normvec = self._solve_alpha(ds_opt)
+                        reftrack_refined = self._build_refined_reftrack(alpha_m, normvec)
+                        self._update_reftrack(reftrack_refined)
+                        ds_current = self.lengths.copy()   # new initial ds for next block
+                        print(f"  [path refine {blk_idx + 1}/{n_refinements}] "
+                              f"{reftrack_refined.shape[0]} ctrl pts  |  "
+                              f"laptime ≈ {self.f_t(ds_current):.3f} s")
+                    else:
+                        ds_current = ds_opt   # final optimised result on current track
+
+                return ds_current
 
         if solver == 'CMA':
-            mean = self.lengths
-            sigma = 0.001
-            popsize = 16
-            s_cmaa = np.zeros_like(mean)
-            mc=1
-            for i in range(self.MC):
-                cma_es_s = ConstrainedCMAES_t(self.f_t,mean, sigma, popsize, bounds1=np.ones_like(self.lengths)*self.max_s, bounds2=np.ones_like(self.lengths)*self.min_s)
-                s_cmai= cma_es_s.optimize(iterations=self.iterations_CMA)
-                s_cmaa += s_cmai
-            s_cmaa = s_cmaa/self.MC
-            return s_cmaa
+            if not use_refinement:
+                # ----------------------------------------------------------------
+                # Original behaviour: MC runs, no path refinement
+                # ----------------------------------------------------------------
+                mean = self.lengths.copy()
+                s_cmaa = np.zeros_like(mean)
+                for _ in range(self.MC):
+                    cma_es_s = ConstrainedCMAES_t(
+                        self.f_t, mean, self.sigma, self.popsize,
+                        bounds1=np.ones_like(self.lengths) * self.max_s,
+                        bounds2=np.ones_like(self.lengths) * self.min_s)
+                    s_cmai = cma_es_s.optimize(iterations=self.iterations_CMA)
+                    s_cmaa += s_cmai
+                return s_cmaa / self.MC
 
-    def generate_raceline(self,ds=None,solver='ZO'):
+            else:
+                # ----------------------------------------------------------------
+                # Refinement-aware loop (mirrors the ZO logic)
+                # ----------------------------------------------------------------
+                if self.MC > 1:
+                    print("WARNING [CurveLenOpt]: MC > 1 is not supported with path "
+                          "refinement; running a single pass (MC=1).")
+
+                q = int(q)
+                if q > self.iterations_CMA:
+                    print(f"WARNING [CurveLenOpt]: refine_every ({q}) > iterations_CMA "
+                          f"({self.iterations_CMA}). No refinement will occur.")
+
+                # Partition total CMA iterations into blocks of q.
+                # Refinement happens BETWEEN blocks, not after the final block.
+                n_full = self.iterations_CMA // q
+                rem    = self.iterations_CMA % q
+                all_blocks = [q] * n_full
+                if rem > 0:
+                    all_blocks.append(rem)
+                n_blocks = len(all_blocks)
+                n_refinements = n_blocks - 1
+
+                ds_current = self.lengths.copy()
+
+                for blk_idx, blk_iters in enumerate(all_blocks):
+                    cma_es_s = ConstrainedCMAES_t(
+                        self.f_t, ds_current, self.sigma, self.popsize,
+                        bounds1=np.ones_like(ds_current) * self.max_s,
+                        bounds2=np.ones_like(ds_current) * self.min_s)
+                    ds_opt = cma_es_s.optimize(iterations=blk_iters)
+
+                    is_last = (blk_idx == n_blocks - 1)
+
+                    if not is_last:
+                        # Solve QP → exact alpha + normals → geometrically correct reftrack
+                        alpha_m, normvec = self._solve_alpha(ds_opt)
+                        reftrack_refined = self._build_refined_reftrack(alpha_m, normvec)
+                        self._update_reftrack(reftrack_refined)
+                        ds_current = self.lengths.copy()   # new initial mean for next block
+                        print(f"  [path refine {blk_idx + 1}/{n_refinements}] "
+                              f"{reftrack_refined.shape[0]} ctrl pts  |  "
+                              f"laptime ≈ {self.f_t(ds_current):.3f} s")
+                    else:
+                        ds_current = ds_opt   # final optimised result on current track
+
+                return ds_current
+
+    def generate_raceline(self, ds=None, solver='ZO', refine_every=None):
         """
 
         .. description::
-        Generates the optimized raceline geometry for a given set of spline segment lengths. If no segment
-        lengths are provided, runs CurveLenOpt first to obtain them.
+        Generates the optimized raceline geometry for a given set of spline segment lengths.
+        If no segment lengths are provided, runs CurveLenOpt first to obtain them.
+
+        When refine_every is set, CurveLenOpt is called with that cadence and self.reftrack
+        may be updated as a side-effect (see CurveLenOpt docs).  The returned raceline is
+        computed on whatever self.reftrack is current after that call.
 
         .. inputs::
-        :param ds:          array of spline segment lengths. If None, computed via CurveLenOpt.
-        :type ds:           np.ndarray
-        :param solver:      solver to use if ds is None. 'ZO' or 'CMA'.
-        :type solver:       str
+        :param ds:              array of spline segment lengths. If None, computed via
+                                CurveLenOpt(solver, refine_every).
+        :type ds:               np.ndarray
+        :param solver:          solver to use if ds is None. 'ZO' or 'CMA'.
+        :type solver:           str
+        :param refine_every:    per-call refinement cadence passed to CurveLenOpt when
+                                ds is None.  None uses self.refine_every (default: no refinement).
+        :type refine_every:     int or None
 
         .. outputs::
         :return raceline_interp:    interpolated raceline coordinates [x, y].
@@ -728,7 +1046,7 @@ class Opt_min_CurvTime:
         """
 
         if ds is None:
-            ds = self.CurveLenOpt(solver)
+            ds = self.CurveLenOpt(solver=solver, refine_every=refine_every)
 
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((self.reftrack[:, 0:2], self.reftrack[0, 0:2])),el_lengths=ds)
         H, f, G , h = H_f(reftrack=self.reftrack,
@@ -747,18 +1065,27 @@ class Opt_min_CurvTime:
                     stepsize_interp=self.si)
         return raceline_interp,ds
     
-    def generate_kinProfs(self,ds=None,solver='ZO'):
+    def generate_kinProfs(self, ds=None, solver='ZO', refine_every=None):
         """
 
         .. description::
-        Generates the full kinematic profiles (velocity, acceleration, curvature, time, raceline) for a given
-        set of spline segment lengths. If no segment lengths are provided, runs CurveLenOpt first.
+        Generates the full kinematic profiles (velocity, acceleration, curvature, time,
+        raceline) for a given set of spline segment lengths.  If no segment lengths are
+        provided, runs CurveLenOpt first.
+
+        When refine_every is set, CurveLenOpt is called with that cadence and self.reftrack
+        may be updated as a side-effect (see CurveLenOpt docs).  All profiles are then
+        computed on whatever self.reftrack is current after that call.
 
         .. inputs::
-        :param ds:          array of spline segment lengths. If None, computed via CurveLenOpt.
-        :type ds:           np.ndarray
-        :param solver:      solver to use if ds is None. 'ZO' or 'CMA'.
-        :type solver:       str
+        :param ds:              array of spline segment lengths. If None, computed via
+                                CurveLenOpt(solver, refine_every).
+        :type ds:               np.ndarray
+        :param solver:          solver to use if ds is None. 'ZO' or 'CMA'.
+        :type solver:           str
+        :param refine_every:    per-call refinement cadence passed to CurveLenOpt when
+                                ds is None.  None uses self.refine_every (default: no refinement).
+        :type refine_every:     int or None
 
         .. outputs::
         :return s_splines:          cumulative distance profile along the raceline in m.
@@ -776,7 +1103,7 @@ class Opt_min_CurvTime:
         """
 
         if ds is None:
-            ds = self.CurveLenOpt(solver)
+            ds = self.CurveLenOpt(solver=solver, refine_every=refine_every)
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((self.reftrack[:, 0:2], self.reftrack[0, 0:2])),el_lengths=ds)
         H, f, G , h = H_f(reftrack=self.reftrack,
                                                  normvectors=normvec_norm,
@@ -825,39 +1152,60 @@ class Opt_min_CurvTime:
         
         return s_splines, vx_profile_opt, ax_profile_opt, kappa_opt, t_profile_cl, raceline_interp
     
-    def Comparison(self,ds_ZO=None,ds_CMA=None, plot='N', output = 'N'):
+    def Comparison(self, ds_ZO=None, ds_CMA=None, plot='N', output='N', refine_every=None):
         """
 
         .. description::
-        Compares raceline kinematic profiles across four cases: ZO-optimized, CMA-ES-optimized, initial
-        segment lengths, and the centerline. Prints lap times and optionally plots and returns all profiles.
+        Compares raceline kinematic profiles across four cases: ZO-optimized, CMA-ES-optimized,
+        initial segment lengths, and the centerline.  Prints lap times and optionally plots and
+        returns all profiles.
+
+        Each solver is always run from the original base reference track so the comparison is
+        fair regardless of whether path refinement is used for ZO.  self.reftrack is reset to
+        the base track when Comparison returns.
 
         .. inputs::
-        :param ds_ZO:       optimized segment lengths from the ZO solver. If None, computed internally.
-        :type ds_ZO:        np.ndarray
-        :param ds_CMA:      optimized segment lengths from the CMA-ES solver. If None, computed internally.
-        :type ds_CMA:       np.ndarray
-        :param plot:        'Y' to display comparison plots, 'N' to skip.
-        :type plot:         str
-        :param output:      controls which profiles are returned. 'Y' returns all four, 'ZO'/'CMA'/'initial'/'center'
-                            returns the corresponding case only. 'N' returns nothing.
-        :type output:       str
+        :param ds_ZO:           optimized segment lengths from the ZO solver. If None, computed
+                                internally via CurveLenOpt('ZO', refine_every).
+        :type ds_ZO:            np.ndarray
+        :param ds_CMA:          optimized segment lengths from the CMA-ES solver. If None,
+                                computed internally via CurveLenOpt('CMA').
+        :type ds_CMA:           np.ndarray
+        :param plot:            'Y' to display comparison plots, 'N' to skip.
+        :type plot:             str
+        :param output:          controls which profiles are returned. 'Y' returns all four,
+                                'ZO'/'CMA'/'initial'/'center' returns the corresponding case
+                                only. 'N' returns nothing.
+        :type output:           str
+        :param refine_every:    path-refinement cadence forwarded to CurveLenOpt for the ZO
+                                solver only.  None (default) uses self.refine_every.
+        :type refine_every:     int or None
 
         .. outputs::
-        :return profiles:   kinematic profiles (s_splines, vx, ax, kappa, t_profile, raceline) for the selected
-                            output case(s). None if output is 'N'.
+        :return profiles:   kinematic profiles (s_splines, vx, ax, kappa, t_profile, raceline)
+                            for the selected output case(s). None if output is 'N'.
         :rtype profiles:    tuple or None
         """
 
+        # ---- ZO (run from original base track; refinement optional) ----
+        self._update_reftrack(self._base_reftrack.copy())
         if ds_ZO is None:
-            ds_ZO = self.CurveLenOpt(solver='ZO')
+            ds_ZO = self.CurveLenOpt(solver='ZO', refine_every=refine_every)
+        s_splines, vx_profile_opt, ax_profile_opt, kappa_opt, t_profile_cl, raceline_interp = \
+            self.generate_kinProfs(ds=ds_ZO)
+
+        # ---- CMA (always from original base track, no refinement) ----
+        self._update_reftrack(self._base_reftrack.copy())
         if ds_CMA is None:
             ds_CMA = self.CurveLenOpt(solver='CMA')
-        ds0 = self.lengths
+        s_splines1, vx_profile_opt1, ax_profile_opt1, kappa_opt1, t_profile_cl1, raceline_interp1 = \
+            self.generate_kinProfs(ds=ds_CMA)
 
-        s_splines, vx_profile_opt, ax_profile_opt, kappa_opt, t_profile_cl, raceline_interp = self.generate_kinProfs(ds=ds_ZO)
-        s_splines1, vx_profile_opt1, ax_profile_opt1, kappa_opt1, t_profile_cl1, raceline_interp1 = self.generate_kinProfs(ds=ds_CMA)
-        s_splines2, vx_profile_opt2, ax_profile_opt2, kappa_opt2, t_profile_cl2, raceline_interp2 = self.generate_kinProfs(ds=ds0)
+        # ---- initial segment lengths (base track, no optimisation) ----
+        self._update_reftrack(self._base_reftrack.copy())
+        ds0 = self.lengths.copy()
+        s_splines2, vx_profile_opt2, ax_profile_opt2, kappa_opt2, t_profile_cl2, raceline_interp2 = \
+            self.generate_kinProfs(ds=ds0)
 
 
         ##Calculate the profiles for centerline
@@ -1031,7 +1379,10 @@ class Opt_min_CurvTime:
             plt.grid(True)
             plt.show()
 
-        if output =='Y':
+        # Always restore original track when Comparison exits
+        self._update_reftrack(self._base_reftrack.copy())
+
+        if output == 'Y':
             return  s_splines, vx_profile_opt, ax_profile_opt, kappa_opt, t_profile_cl, raceline_interp,\
                     s_splines1, vx_profile_opt1, ax_profile_opt1, kappa_opt1, t_profile_cl1, raceline_interp1,\
                     s_splines2, vx_profile_opt2, ax_profile_opt2, kappa_opt2, t_profile_cl2, raceline_interp2,\
@@ -1040,11 +1391,587 @@ class Opt_min_CurvTime:
             return  s_splines, vx_profile_opt, ax_profile_opt, kappa_opt, t_profile_cl, raceline_interp
         if output == 'CMA':
             return  s_splines1, vx_profile_opt1, ax_profile_opt1, kappa_opt1, t_profile_cl1, raceline_interp1
-        if output =='initial':
+        if output == 'initial':
             return s_splines2, vx_profile_opt2, ax_profile_opt2, kappa_opt2, t_profile_cl2, raceline_interp2
-        if output =='center':
+        if output == 'center':
             return s_splines4, vx_profile_opt4, ax_profile_opt4, kappa_opt4, t_profile_cl4, raceline_interp4
-        
+
+
+# ===========================================================================
+# Blackbox_raceline
+# ===========================================================================
+
+class Blackbox_raceline:
+    """
+    Direct zeroth-order (ZO) optimization of the lateral shift vector alpha
+    for minimum lap time (or a user-supplied blackbox cost function).
+
+    Motivation
+    ----------
+    The existing ``Opt_min_CurvTime`` class uses a two-stage pipeline:
+    ZO/CMA-ES optimizes spline segment lengths ds → QP solves for alpha that
+    minimizes *curvature* (a proxy for lap time).  The curvature proxy is
+    inexact and couples geometry to the inner QP.
+
+    ``Blackbox_raceline`` bypasses both stages.  Alpha is the optimization
+    variable directly and the true lap time (from ``KinematicProfs``) is the
+    cost function, so there is no proxy and no inner QP.
+
+    Formulation
+    -----------
+    * Variable   : ``alpha`` ∈ R^N, one lateral shift per control point
+    * Feasible set: box  ``alpha[i] ∈ [-(w_left[i] - sfty), (w_right[i] - sfty)]``
+    * Objective  : ``minimize cost(alpha)``  [default: lap time]
+    * Method     : projected ZO stochastic gradient descent
+
+    The box constraint is the same as the QP constraint used inside
+    ``Opt_min_CurvTime``, so the feasible region is identical.
+
+    Fixed normal vectors
+    --------------------
+    Spline normal vectors are computed once from the Euclidean segment lengths
+    of the initial ``reftrack`` and held fixed throughout the run.  Alpha is
+    interpreted as displacement along these fixed normals, which keeps the
+    box-projection exact and avoids recomputing splines at every iteration.
+
+    Gradient estimation
+    -------------------
+    Two oracles are supported for sampling the random direction u:
+
+    * ``'gaussian'`` : u ~ N(0, I_N)  — standard Gaussian ZO estimator
+    * ``'sphere'``   : u ~ Uniform(S^{N-1})  — normalized Gaussian; trades
+      higher variance for uniform coverage of the search space
+
+    Two finite-difference schemes are supported:
+
+    * ``'noth'`` (forward) : ``g = (f(alpha + μu) - f(alpha)) / μ * u``
+      — 1 extra function evaluation per direction
+    * ``'h'`` (central)    : ``g = (f(alpha + μu) - f(alpha - μu)) / 2μ * u``
+      — 2 extra evaluations per direction, lower bias
+
+    Parameters
+    ----------
+    reftrack : np.ndarray, shape (N, 4)
+        Reference track [x, y, w_right, w_left].  Unclosed.
+    ggv : np.ndarray
+        GGV table already loaded, shape (K, 3) → [vx, ax_max, ay_max].
+    ax_max_machines : np.ndarray
+        Machine longitudinal limits, shape (L, 2) → [vx, ax_max].
+    sfty : float
+        Vehicle safety half-width in m (box constraint clearance).
+    v_max : float
+        Maximum velocity [m/s].
+    si : float
+        Raceline interpolation stepsize [m].
+    fw : int or None
+        Velocity profile convolution filter window length.  None = no filter.
+    m_veh : float
+        Vehicle mass [kg].
+    drag_coeff : float
+        Drag coefficient: 0.5 * c_w * A_front * rho_air.
+    dyn_model_exp : float
+        Dynamics model exponent in [1.0, 2.0].
+    cost_fn : callable or None
+        User-supplied cost function ``cost_fn(alpha) -> float``.
+        If None the default lap-time oracle is used.
+    init : str
+        Initial alpha strategy.
+
+        ``'random'``  — alpha_0 sampled uniformly inside the feasible box.
+        ``'mincurv'`` — alpha_0 = QP minimum-curvature solution on reftrack
+                        (warm start from the best geometric proxy).
+    oracle : str
+        ``'gaussian'`` or ``'sphere'`` (see above).
+    mu : float
+        ZO smoothing / perturbation magnitude μ.
+    h : float
+        Gradient-descent step size.
+    t : int
+        Number of random directions averaged per gradient estimate.
+    grad_type : str
+        ``'noth'`` (forward difference) or ``'h'`` (central difference).
+    iterations : int
+        Total number of gradient steps.
+    kappa_bound : float
+        Curvature bound used for the QP when ``init='mincurv'``.
+    seed : int or None
+        Global random seed set at construction time.  Reapply with
+        ``find_alpha(seed=...)`` for per-run reproducibility.
+    """
+
+    def __init__(
+        self,
+        reftrack: np.ndarray,
+        ggv: np.ndarray,
+        ax_max_machines: np.ndarray,
+        sfty: float = 1.0,
+        v_max: float = 22.88,
+        si: float = 0.8,
+        fw: int = 3,
+        m_veh: float = 1000.0,
+        drag_coeff: float = 0.0,
+        dyn_model_exp: float = 1.0,
+        cost_fn=None,
+        init: str = 'random',
+        oracle: str = 'gaussian',
+        mu: float = 0.05,
+        h: float = 0.001,
+        t: int = 1,
+        grad_type: str = 'noth',
+        iterations: int = 300,
+        kappa_bound: float = 0.7,
+        seed: int = None,
+    ):
+        # ---- store hyper-parameters -------------------------------------------
+        self.reftrack      = reftrack.copy()
+        self.N             = reftrack.shape[0]
+        self.ggv           = ggv
+        self.ax_max_machines = ax_max_machines
+        self.sfty          = sfty
+        self.v_max         = v_max
+        self.si            = si
+        self.fw            = fw
+        self.m_veh         = m_veh
+        self.drag_coeff    = drag_coeff
+        self.dyn_model_exp = dyn_model_exp
+        self.cost_fn       = cost_fn
+        self.init          = init
+        self.oracle        = oracle
+        self.mu            = mu
+        self.h             = h
+        self.t             = t
+        self.grad_type     = grad_type
+        self.iterations    = iterations
+        self.kappa_bound   = kappa_bound
+
+        if seed is not None:
+            np.random.seed(seed)
+
+        # ---- box constraints  (same convention as QP inside Opt_min_CurvTime) --
+        #   positive alpha → shift toward the right boundary (w_right side)
+        #   negative alpha → shift toward the left  boundary (w_left  side)
+        self.lo = -(reftrack[:, 3] - sfty)   # lower bound (max left shift)
+        self.hi =   reftrack[:, 2] - sfty    # upper bound (max right shift)
+
+        bad = np.where(self.lo > self.hi)[0]
+        if bad.size > 0:
+            raise ValueError(
+                f"Track is narrower than the safety margin at {bad.size} point(s) "
+                f"(indices: {bad[:5]}{'...' if bad.size > 5 else ''}).  "
+                "Reduce sfty or check track widths.")
+
+        # ---- fixed normal vectors (computed once from initial Euclidean ds) ----
+        ds_init = np.hypot(
+            np.diff(np.r_[reftrack[:, 0], reftrack[0, 0]]),
+            np.diff(np.r_[reftrack[:, 1], reftrack[0, 1]]))
+        _, _, self._M, self._normvec = calc_splines(
+            path=np.vstack((reftrack[:, :2], reftrack[0, :2])),
+            el_lengths=ds_init,
+            use_dist_scaling=True)
+
+        # ---- p_ggv cache (keyed by interpolated raceline length) ---------------
+        self._p_ggv_cache: dict = {}
+
+        # ---- initial alpha + result placeholders --------------------------------
+        self.alpha_0   = self._init_alpha()
+        self.alpha_opt = self.alpha_0.copy()
+        self.history   = None
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _init_alpha(self) -> np.ndarray:
+        """Return the initial alpha vector according to self.init.
+
+        Supported modes
+        ---------------
+        'zero'
+            Start with zero shift (alpha = 0), i.e. the original reference track.
+        'random'
+            Uniform sample inside the feasible box [lo, hi].
+        'mincurv'
+            Solve the minimum-curvature QP (H_f) and use the result as the
+            warm-start.  This is the best geometric proxy for lap-time and
+            typically the fastest starting point for further ZO/CMA refinement.
+        'shortest' (aliases: 'shortest_path', 'sp')
+            Solve the Optimal Shortest Path (OSP) QP and use that alpha.
+            The shortest path has maximum corner radii (less lateral movement
+            overall) which sometimes beats mincurv as a starting point on
+            tracks where sustained high speed on long straights matters more
+            than corner apex curvature.
+        """
+        if self.init == 'random':
+            return np.random.uniform(self.lo, self.hi)
+        elif self.init == 'zero':
+            return np.zeros(self.N)
+
+        elif self.init == 'mincurv':
+            # Warm-start from the QP min-curvature solution on the original reftrack.
+            # This is the best geometric proxy available and typically a better starting
+            # point than a random interior point.
+            H, f_vec, G, h_vec = H_f(
+                reftrack=self.reftrack,
+                normvectors=self._normvec,
+                A=self._M,
+                kappa_bound=self.kappa_bound,
+                w_veh=self.sfty,
+                closed=True)
+            alpha_mc = quadprog.solve_qp(H, -f_vec, -G.T, -h_vec, 0)[0]
+            # Clip in case QP and Blackbox box constraints differ by a rounding epsilon
+            return np.clip(alpha_mc, self.lo, self.hi)
+
+        elif self.init in ('shortest', 'shortest_path', 'sp'):
+            # Warm-start from the OSP (Optimal Shortest Path) QP solution.
+            # OSP internally uses w_veh/2 as the per-side clearance; we pass
+            # 2*sfty so that w_veh/2 = sfty, giving the same feasible box as
+            # Blackbox_raceline uses for the gradient descent.
+            H_sp, f_sp, G_sp, h_sp = OSP(
+                reftrack=self.reftrack,
+                normvectors=self._normvec,
+                w_veh=2.0 * self.sfty)
+            alpha_sp = quadprog.solve_qp(H_sp, -f_sp, -G_sp.T, -h_sp, 0)[0]
+            # Clip to Blackbox box (OSP and H_f constraints can differ slightly
+            # due to numerical tolerances or rounding in dev_max).
+            return np.clip(alpha_sp, self.lo, self.hi)
+
+        else:
+            raise ValueError(
+                f"Unknown init mode '{self.init}'.  "
+                "Use 'random', 'mincurv', or 'shortest'.")
+
+    def _sample_direction(self) -> np.ndarray:
+        """Sample a unit-scaled random direction u according to self.oracle."""
+        u = np.random.normal(0.0, 1.0, size=self.N)
+        if self.oracle == 'sphere':
+            norm = np.linalg.norm(u)
+            if norm > 1e-12:
+                u /= norm          # project onto N-sphere
+        elif self.oracle != 'gaussian':
+            raise ValueError(
+                f"Unknown oracle '{self.oracle}'.  Use 'gaussian' or 'sphere'.")
+        return u
+
+    def _eval_cost(self, alpha: np.ndarray) -> float:
+        """Evaluate cost at alpha (dispatch to user cost_fn or lap-time oracle)."""
+        if self.cost_fn is not None:
+            return float(self.cost_fn(alpha))
+        return self._laptime_cost(alpha)
+
+    def _laptime_cost(self, alpha: np.ndarray) -> float:
+        """
+        Default cost oracle: build raceline from alpha and return the lap time
+        computed by the KinematicProfs forward-backward velocity solver.
+        """
+        _, _, cx, cy, si_idx, tv, _, _, el = create_raceline(
+            refline=self.reftrack[:, :2],
+            normvectors=self._normvec,
+            alpha=alpha,
+            stepsize_interp=self.si)
+        _, kappa = calc_head_curv_an(
+            coeffs_x=cx, coeffs_y=cy, ind_spls=si_idx, t_spls=tv)
+
+        n = kappa.size
+        if n not in self._p_ggv_cache:
+            self._p_ggv_cache[n] = np.repeat(
+                np.expand_dims(self.ggv, axis=0), n, axis=0)
+
+        vx = calc_vel_profile(
+            ggv=self.ggv,
+            ax_max_machines=self.ax_max_machines,
+            v_max=self.v_max,
+            kappa=kappa,
+            el_lengths=el,
+            closed=True,
+            filt_window=self.fw,
+            dyn_model_exp=self.dyn_model_exp,
+            drag_coeff=self.drag_coeff,
+            m_veh=self.m_veh,
+            p_ggv=self._p_ggv_cache[n])
+
+        vx_cl  = np.append(vx, vx[0])
+        ax_prof = calc_ax_profile(
+            vx_profile=vx_cl, el_lengths=el, eq_length_output=False)
+        t_prof  = calc_t_profile(
+            vx_profile=vx, ax_profile=ax_prof, el_lengths=el)
+        return float(t_prof[-1])
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def find_alpha(
+        self,
+        solver: str = 'ZO',
+        n_iter: int = None,
+        # ZO parameters
+        step_size: float = None,
+        mu: float = None,
+        t: int = None,
+        grad_type: str = None,
+        # CMA-ES parameters
+        sigma: float = None,
+        popsize: int = None,
+        # Common
+        seed: int = None,
+        verbose: bool = True,
+        print_every: int = 50,
+    ):
+        """
+        Minimize the cost over alpha using either ZO gradient descent or CMA-ES.
+
+        Both solvers respect the box constraint ``alpha ∈ [lo, hi]`` via
+        projection (ZO) or clipping of the sampled population (CMA-ES).
+        The best alpha seen across all evaluations is tracked and stored in
+        ``self.alpha_opt``; ``self.history`` records the best-so-far cost at
+        the end of each iteration/generation.
+
+        Parameters
+        ----------
+        solver : str
+            ``'ZO'``  — projected zeroth-order stochastic gradient descent.
+            ``'CMA'`` — CMA-ES evolutionary strategy.
+        n_iter : int or None
+            For ZO  : number of gradient steps (default: ``self.iterations``).
+            For CMA : number of generations    (default: ``self.iterations``).
+            One CMA generation = ``popsize`` function evaluations.
+        step_size : float or None   [ZO only]
+            Gradient step size h.  Defaults to ``self.h``.
+        mu : float or None          [ZO only]
+            Perturbation magnitude μ.  Defaults to ``self.mu``.
+        t : int or None             [ZO only]
+            Directions averaged per gradient estimate.  Defaults to ``self.t``.
+        grad_type : str or None     [ZO only]
+            ``'noth'`` (forward difference) or ``'h'`` (central difference).
+            Defaults to ``self.grad_type``.
+        sigma : float or None       [CMA only]
+            Initial step-size (standard deviation) for CMA-ES.
+            A good default is ~(1/3) × (hi - lo) range, but it is
+            problem-specific.  Defaults to ``self.h`` (used as a scale proxy).
+        popsize : int or None       [CMA only]
+            Population size (number of candidate solutions per generation).
+            Defaults to ``4 + int(3 * np.log(self.N))`` (CMA-ES heuristic).
+        seed : int or None
+            Random seed reset before the loop.
+        verbose : bool
+            Print progress every ``print_every`` iterations/generations.
+        print_every : int
+            Verbosity interval.
+
+        Returns
+        -------
+        best_alpha : np.ndarray, shape (N,)
+            Alpha that achieved the lowest observed cost.
+        history : np.ndarray, shape (n_iter + 1,)
+            ``history[0]`` = cost of the initial alpha_0.
+            ``history[k]`` = best-so-far cost after iteration/generation k.
+        """
+        if seed is not None:
+            np.random.seed(seed)
+
+        n_iter = n_iter if n_iter is not None else self.iterations
+
+        # ---- evaluate starting point (common to both solvers) ------------------
+        alpha_start = self.alpha_0.copy()
+        f_start     = self._eval_cost(alpha_start)
+        best_alpha  = alpha_start.copy()
+        best_cost   = f_start
+        history     = np.full(n_iter + 1, np.nan)
+        history[0]  = f_start
+
+        if verbose:
+            print(f"[Blackbox_raceline/{solver}] init  laptime = {f_start:.4f} s"
+                  f"  (init='{self.init}', N={self.N})")
+
+        # ====================================================================
+        # ZO — projected stochastic gradient descent
+        # ====================================================================
+        if solver == 'ZO':
+            step_size = step_size if step_size is not None else self.h
+            mu        = mu        if mu        is not None else self.mu
+            t_dirs    = t         if t         is not None else self.t
+            grad_type = grad_type if grad_type is not None else self.grad_type
+
+            alpha  = alpha_start.copy()
+            f_curr = f_start
+
+            for k in range(n_iter):
+
+                # gradient estimate averaged over t_dirs random directions
+                grad_sum = np.zeros(self.N)
+                for _ in range(t_dirs):
+                    u = self._sample_direction()
+
+                    alpha_fwd = np.clip(alpha + mu * u, self.lo, self.hi)
+                    f_fwd     = self._eval_cost(alpha_fwd)
+
+                    if grad_type == 'noth':
+                        g = (f_fwd - f_curr) / mu * u
+                    else:                              # 'h' = central difference
+                        alpha_bwd = np.clip(alpha - mu * u, self.lo, self.hi)
+                        f_bwd     = self._eval_cost(alpha_bwd)
+                        g = (f_fwd - f_bwd) / (2.0 * mu) * u
+
+                    grad_sum += g
+
+                grad_est = grad_sum / t_dirs
+
+                # projected gradient step
+                alpha  = np.clip(alpha - step_size * grad_est, self.lo, self.hi)
+                f_curr = self._eval_cost(alpha)
+
+                if f_curr < best_cost:
+                    best_cost  = f_curr
+                    best_alpha = alpha.copy()
+                history[k + 1] = best_cost
+
+                if verbose and (k + 1) % print_every == 0:
+                    print(f"  iter {k + 1:4d}/{n_iter}:  laptime = {f_curr:.4f} s"
+                          f"   best = {best_cost:.4f} s")
+
+        # ====================================================================
+        # CMA-ES — covariance matrix adaptation evolution strategy
+        # ====================================================================
+        elif solver == 'CMA':
+            # Default sigma: 1/6 of the mean box half-width (explores ~1σ
+            # within the feasible range with high probability)
+            if sigma is None:
+                sigma = float(np.mean(self.hi - self.lo)) / 6.0
+            if popsize is None:
+                popsize = 4 + int(3 * np.log(self.N))   # CMA-ES standard heuristic
+
+            # Wrap _eval_cost to track best-ever across all individual evaluations
+            _best = {'alpha': best_alpha.copy(), 'cost': best_cost}
+
+            def _tracked_cost(a: np.ndarray) -> float:
+                c = self._eval_cost(a)
+                if c < _best['cost']:
+                    _best['cost']  = c
+                    _best['alpha'] = a.copy()
+                return c
+
+            cma = ConstrainedCMAES_t(
+                _tracked_cost,
+                mean=alpha_start.copy(),
+                sigma=sigma,
+                popsize=popsize,
+                bounds1=self.hi,
+                bounds2=self.lo)
+            # ConstrainedCMAES_t.update() references self.iterations (normally
+            # set inside optimize()).  We manage the loop ourselves for
+            # best-tracking, so we must initialise it here.
+            cma.iterations = 0
+
+            for gen in range(n_iter):
+                samples = cma.sample_population()
+                fitness = np.array([cma.objective_function(s) for s in samples])
+                cma.update(samples, fitness)
+                cma.iterations += 1
+                history[gen + 1] = _best['cost']  # best-so-far after this generation
+
+                if verbose and (gen + 1) % print_every == 0:
+                    print(f"  gen  {gen + 1:4d}/{n_iter}:  gen_best = {min(fitness):.4f} s"
+                          f"   best = {_best['cost']:.4f} s")
+
+            best_alpha = _best['alpha']
+            best_cost  = _best['cost']
+
+        else:
+            raise ValueError(f"Unknown solver '{solver}'.  Use 'ZO' or 'CMA'.")
+
+        # ---- finalise ----------------------------------------------------------
+        if verbose:
+            print(f"[Blackbox_raceline/{solver}] done  best laptime = {best_cost:.4f} s"
+                  f"  (improvement = {f_start - best_cost:.4f} s)")
+
+        self.alpha_opt = best_alpha
+        self.history   = history
+        return best_alpha, history
+
+    def generate_raceline(self, alpha: np.ndarray = None):
+        """
+        Build the full raceline and kinematic profiles for a given alpha.
+
+        Parameters
+        ----------
+        alpha : np.ndarray or None
+            Lateral shift vector, shape (N,).  If None, uses self.alpha_opt
+            (the best alpha from the most recent find_alpha() call).
+
+        Returns
+        -------
+        s : np.ndarray
+            Cumulative distance along the raceline [m], shape (M,).
+        vx : np.ndarray
+            Velocity profile [m/s], shape (M,)  (unclosed).
+        ax : np.ndarray
+            Longitudinal acceleration [m/s²], shape (M,)  (closed wrap-around).
+        kappa : np.ndarray
+            Curvature [rad/m], shape (M,).
+        t_prof : np.ndarray
+            Cumulative lap time [s], shape (M + 1,).  t_prof[-1] = total lap time.
+        raceline_xy : np.ndarray
+            Interpolated raceline coordinates [x, y], shape (M, 2).
+        """
+        if alpha is None:
+            if self.alpha_opt is None:
+                raise RuntimeError(
+                    "No alpha available.  Run find_alpha() first or pass alpha explicitly.")
+            alpha = self.alpha_opt
+
+        raceline_xy, _, cx, cy, si_idx, tv, _, _, el = create_raceline(
+            refline=self.reftrack[:, :2],
+            normvectors=self._normvec,
+            alpha=alpha,
+            stepsize_interp=self.si)
+        _, kappa = calc_head_curv_an(
+            coeffs_x=cx, coeffs_y=cy, ind_spls=si_idx, t_spls=tv)
+
+        s = cumulative_distances(el)
+
+        n = kappa.size
+        if n not in self._p_ggv_cache:
+            self._p_ggv_cache[n] = np.repeat(
+                np.expand_dims(self.ggv, axis=0), n, axis=0)
+
+        vx = calc_vel_profile(
+            ggv=self.ggv,
+            ax_max_machines=self.ax_max_machines,
+            v_max=self.v_max,
+            kappa=kappa,
+            el_lengths=el,
+            closed=True,
+            filt_window=self.fw,
+            dyn_model_exp=self.dyn_model_exp,
+            drag_coeff=self.drag_coeff,
+            m_veh=self.m_veh,
+            p_ggv=self._p_ggv_cache[n])
+
+        vx_cl  = np.append(vx, vx[0])
+        ax     = calc_ax_profile(
+            vx_profile=vx_cl, el_lengths=el, eq_length_output=False)
+        t_prof = calc_t_profile(
+            vx_profile=vx, ax_profile=ax, el_lengths=el)
+
+        return s, vx, ax, kappa, t_prof, raceline_xy
+
+    def reset_alpha(self, new_init: str = None):
+        """
+        Re-initialize alpha_0 (and reset alpha_opt / history).
+
+        Useful for multi-start experiments: call reset_alpha() then find_alpha()
+        to run a fresh trial from a new starting point.
+
+        Parameters
+        ----------
+        new_init : str or None
+            Override init strategy ('random' or 'mincurv').  None keeps current.
+        """
+        if new_init is not None:
+            self.init = new_init
+        self.alpha_0   = self._init_alpha()
+        self.alpha_opt = self.alpha_0.copy()
+        self.history   = None
 
 
 from scipy.integrate import quad
