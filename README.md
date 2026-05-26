@@ -1,6 +1,10 @@
-# OptiLine
+# OptiLine-R
 
 Raceline Optimisation Toolkit.
+
+**Installation**
+
+https://pypi.org/project/OptiLine-R/0.1.6/
 
 📖 **Full documentation**
 
