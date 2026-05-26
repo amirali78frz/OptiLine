@@ -1,11 +1,15 @@
 [project]
-name = "OptiLine"
-version = "0.1.5"
+name = "OptiLine-R"
+version = "0.1.6"
 description = "Raceline optimisation tools"
 authors = [
     {name = "Amir Ali Farzin", email = "amirali77farzin@gmail.com"}
 ]
+license = "MIT"
 readme = "README.md"
+homepage = "https://github.com/amirali78frz/OptiLine.git"
+repository = "https://github.com/amirali78frz/OptiLine.git"
+keywords = ["raceline", "optimization", "autonomous racing, zeroth-order"]
 requires-python = ">=3.10,<3.13"
 
 dependencies = [
