@@ -1,12 +1,12 @@
 [project]
 name = "OptiLine"
-version = "0.1.0"
+version = "0.1.5"
 description = "Raceline optimisation tools"
 authors = [
     {name = "Amir Ali Farzin", email = "amirali77farzin@gmail.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.10,<3.13"
 
 dependencies = [
     "numpy>=1.24,<3",
