@@ -1,6 +1,6 @@
 [project]
 name = "OptiLine-R"
-version = "0.1.6"
+version = "0.1.7"
 description = "Raceline optimisation tools"
 authors = [
     {name = "Amir Ali Farzin", email = "amirali77farzin@gmail.com"}
@@ -16,6 +16,7 @@ dependencies = [
     "numpy>=1.24,<3",
     "scipy>=1.10,<2",
     "matplotlib>=3.7,<4",
+    "pillow>=10.0,<12",
     "quadprog>=0.1.13,<0.2",
     "casadi>=3.7,<4",
 ]
