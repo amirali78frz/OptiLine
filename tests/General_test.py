@@ -229,7 +229,8 @@ t_start = time.time()
     reftrack=reftrack,
     w_veh=1.0,
     stepsize=2.0,
-    plot=False,
+    plot=True,
+    v_max=70,
     ggv_import_path=GGV_PATH,
     ax_max_machines_import_path=AX_MAX_PATH,
 )
