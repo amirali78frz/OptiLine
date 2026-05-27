@@ -1,0 +1,6 @@
+image: example_2_map.png
+resolution: 0.09621
+origin: [-164.985133983177093,-56.390802811989161, 0.000000]
+negate: 0
+occupied_thresh: 0.45
+free_thresh: 0.196
