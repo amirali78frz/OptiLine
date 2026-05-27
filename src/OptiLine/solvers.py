@@ -2195,6 +2195,7 @@ def ShortestPath(reftrack: np.ndarray,
         w_veh: float,
         stepsize: float,
         plot: bool,
+        v_max = 22.88,
         ggv_import_path="maps/ggv.csv",ax_max_machines_import_path="maps/ax_max_machines.csv") -> np.ndarray:
     """
 
@@ -2210,7 +2211,9 @@ def ShortestPath(reftrack: np.ndarray,
     :type w_veh:                            float
     :param stepsize:                        interpolation step size for the raceline in m (currently unused internally).
     :type stepsize:                         float
-    :param plot:                            if True, displays plots of the raceline and kinematic profiles.
+    :param v_max:                           maximum velocity in m/s for the velocity profile calculation.
+    :type v_max:                            float
+    :param plot:                            flag to enable plotting of the track and raceline.
     :type plot:                             bool
     :param ggv_import_path:                 file path to the ggv diagram CSV.
     :type ggv_import_path:                  str
@@ -2262,7 +2265,7 @@ def ShortestPath(reftrack: np.ndarray,
 
     # s_splines = cumulative_distances(el_lengths_opt_interp)
 
-    vm = 70
+    vm = v_max
     fw = 3
 
     ggv,ax_max_machines =import_veh_dyn_info(ggv_import_path=ggv_import_path,ax_max_machines_import_path=ax_max_machines_import_path)
