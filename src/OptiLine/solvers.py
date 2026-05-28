@@ -753,7 +753,7 @@ class Opt_min_CurvTime:
             normvectors=normvec_norm,
             A=M_mat,
             kappa_bound=self.kapb,
-            w_veh=self.sfty,
+            w_veh=2*self.sfty,
             closed=True)
         alpha_m = quadprog.solve_qp(H, -f, -G.T, -h, 0)[0]
         return alpha_m, normvec_norm
@@ -808,7 +808,7 @@ class Opt_min_CurvTime:
                                                     normvectors=normvec_norm,
                                                     A=M,
                                                     kappa_bound=kapb,
-                                                    w_veh=sfty,
+                                                    w_veh=2*sfty,
                                                     closed=True)
         
         alpha_m = quadprog.solve_qp(H, -f, -G.T,-h,0)[0]
@@ -1053,7 +1053,7 @@ class Opt_min_CurvTime:
                                                  normvectors=normvec_norm,
                                                  A=M,
                                                  kappa_bound=self.kapb,
-                                                 w_veh=self.sfty,
+                                                 w_veh=2*self.sfty,
                                                  closed=True)
                                                  
 
@@ -1109,7 +1109,7 @@ class Opt_min_CurvTime:
                                                  normvectors=normvec_norm,
                                                  A=M,
                                                  kappa_bound=self.kapb,
-                                                 w_veh=self.sfty,
+                                                 w_veh=2*self.sfty,
                                                  closed=True)
                                                  
 
@@ -1216,7 +1216,7 @@ class Opt_min_CurvTime:
                                                  normvectors=normvec_norm,
                                                  A=M,
                                                  kappa_bound=self.kapb,
-                                                 w_veh=self.sfty,
+                                                 w_veh=2*self.sfty,
                                                  closed=True)
         alpha_m_0 = quadprog.solve_qp(H, -f, -G.T,-h,0)[0]
 
@@ -1615,7 +1615,7 @@ class Blackbox_raceline:
                 normvectors=self._normvec,
                 A=self._M,
                 kappa_bound=self.kappa_bound,
-                w_veh=self.sfty,
+                w_veh=2*self.sfty,
                 closed=True)
             alpha_mc = quadprog.solve_qp(H, -f_vec, -G.T, -h_vec, 0)[0]
             # Clip in case QP and Blackbox box constraints differ by a rounding epsilon
