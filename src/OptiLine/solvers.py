@@ -622,6 +622,10 @@ class Opt_min_CurvTime:
         # Immutable copy of the original track; used by reset() and _build_refined_reftrack()
         self._base_reftrack = reftrack.copy()
 
+        # Populated by CurveLenOpt — mirrors alpha_opt / history in Blackbox_raceline
+        self.ds_opt     = None
+        self.ds_history = None
+
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((center[:, 0:2], center[0, 0:2])),use_dist_scaling=True)
         
         self.bound1 = center[:, 0:2] - normvec_norm * np.expand_dims(center[:, 2], axis=1)
@@ -860,50 +864,76 @@ class Opt_min_CurvTime:
     
     def CurveLenOpt(self, solver='ZO', refine_every=None):
         """
+        Optimise spline segment lengths to minimise lap time, tracking and
+        returning the **best** iterate seen rather than the last one.
 
-        .. description::
-        Optimizes the spline segment lengths of the reference track to minimize lap time.
-        Supports two solvers: zeroth-order random method (ZO) and CMA-ES (CMA).
-        Monte Carlo averaging is applied over self.MC runs when refinement is disabled.
 
-        When refine_every is set to a positive integer q the ZO loop is split into blocks
-        of q iterations.  After each block (except the last) the current optimised raceline
-        is extracted, the reference track is rebuilt from that raceline via
-        _build_refined_reftrack, and optimisation continues on the refined track.
-        This updates self.reftrack as a side-effect; call reset() to restore the original.
+        Parameters
+        ----------
+        solver : str
+            ``'ZO'`` for projected zeroth-order gradient descent, ``'CMA'``
+            for CMA-ES.
+        refine_every : int or None
+            Per-call override for ``self.refine_every``.  Positive integer
+            ``q`` enables in-loop path refinement every ``q`` iterations /
+            generations; ``0`` or ``None`` disables it.
 
-        .. inputs::
-        :param solver:          optimization solver to use. 'ZO' for zeroth-order random
-                                method, 'CMA' for CMA-ES.
-        :type solver:           str
-        :param refine_every:    per-call override for self.refine_every.  Positive integer q
-                                enables refinement every q iterations; 0 or None disables it.
-        :type refine_every:     int or None
-
-        .. outputs::
-        :return ds_ff:          optimized array of spline segment lengths for the current
-                                self.reftrack (may be a refined track when refinement is used).
-        :rtype ds_ff:           np.ndarray
+        Returns
+        -------
+        best_ds : np.ndarray
+            Segment lengths that achieved the lowest ``f_t`` value observed.
+        history : np.ndarray
+            ``history[0]`` = cost at the initial ``ds_0``.
+            ``history[k]`` = best-so-far cost after step / generation ``k``
+            (accumulated across all MC runs; concatenated across refinement
+            blocks with the post-refinement initial cost inserted between
+            blocks).
         """
 
-        # Resolve effective refinement cadence (per-call overrides instance default)
         q = refine_every if refine_every is not None else self.refine_every
         use_refinement = (q is not None and int(q) > 0)
 
+        # ====================================================================
+        # ZO solver
+        # ====================================================================
         if solver == 'ZO':
             ds_0 = self.lengths.copy()
 
             if not use_refinement:
                 # ----------------------------------------------------------------
-                # Original behaviour: MC runs, no path refinement
+                # Standard mode: MC independent runs, best tracked globally
                 # ----------------------------------------------------------------
-                ds_ff = np.zeros_like(ds_0)
+                f_start   = self.f_t(ds_0)
+                best_ds   = ds_0.copy()
+                best_cost = f_start
+                history   = np.full(self.MC * self.iterations_ZO + 1, np.nan)
+                history[0] = f_start
+
+                hist_idx = 0
                 for _ in range(self.MC):
-                    ZOs = ZORM(self.f_t, ds_0, self.iterations_ZO,
-                               mu=self.mu, h=self.h, t=self.t, constraint_type='c')
-                    ds = ZOs.optimize(lower_bounds=self.min_s, upper_bounds=self.max_s)
-                    ds_ff += ds[:, -1]
-                return ds_ff / self.MC
+                    ds     = ds_0.copy()
+                    f_curr = f_start
+                    for k in range(self.iterations_ZO):
+                        # gradient estimate: t forward-difference directions
+                        grad_sum = np.zeros_like(ds)
+                        for _ in range(self.t):
+                            u      = np.random.randn(len(ds))
+                            ds_fwd = np.clip(ds + self.mu * u, self.min_s, self.max_s)
+                            f_fwd  = self.f_t(ds_fwd)
+                            grad_sum += (f_fwd - f_curr) / self.mu * u
+                        # projected gradient step; evaluate new iterate
+                        ds     = np.clip(ds - self.h * (grad_sum / self.t),
+                                         self.min_s, self.max_s)
+                        f_curr = self.f_t(ds)
+                        hist_idx += 1
+                        if f_curr < best_cost:
+                            best_cost = f_curr
+                            best_ds   = ds.copy()
+                        history[hist_idx] = best_cost
+
+                self.ds_opt     = best_ds
+                self.ds_history = history
+                return best_ds, history
 
             else:
                 # ----------------------------------------------------------------
@@ -919,59 +949,112 @@ class Opt_min_CurvTime:
                           f"({self.iterations_ZO}). No refinement will occur.")
 
                 # Partition total iterations into blocks of q (last block may be shorter).
-                # Refinement happens BETWEEN blocks, NOT after the final block, so we
-                # always end with an optimised ds on the current self.reftrack.
-                n_full = self.iterations_ZO // q
-                rem    = self.iterations_ZO % q
+                # Refinement happens BETWEEN blocks, NOT after the final block.
+                n_full     = self.iterations_ZO // q
+                rem        = self.iterations_ZO % q
                 all_blocks = [q] * n_full
                 if rem > 0:
                     all_blocks.append(rem)
-                n_blocks = len(all_blocks)
-                n_refinements = n_blocks - 1   # refine between every pair of blocks
+                n_blocks      = len(all_blocks)
+                n_refinements = n_blocks - 1
 
                 ds_current = self.lengths.copy()
+                f_curr     = self.f_t(ds_current)
+                best_ds    = ds_current.copy()
+                best_cost  = f_curr
+                all_hist   = [np.array([f_curr])]  # history[0] = initial cost
 
                 for blk_idx, blk_iters in enumerate(all_blocks):
-                    ZOs = ZORM(self.f_t, ds_current, blk_iters,
-                               mu=self.mu, h=self.h, t=self.t, constraint_type='c')
-                    ds_opt = ZOs.optimize(
-                        lower_bounds=self.min_s, upper_bounds=self.max_s)[:, -1]
+                    blk_hist = []
+                    for k in range(blk_iters):
+                        grad_sum = np.zeros_like(ds_current)
+                        for _ in range(self.t):
+                            u         = np.random.randn(len(ds_current))
+                            ds_fwd    = np.clip(ds_current + self.mu * u,
+                                                self.min_s, self.max_s)
+                            f_fwd     = self.f_t(ds_fwd)
+                            grad_sum += (f_fwd - f_curr) / self.mu * u
+                        ds_current = np.clip(ds_current - self.h * (grad_sum / self.t),
+                                             self.min_s, self.max_s)
+                        f_curr = self.f_t(ds_current)
+                        if f_curr < best_cost:
+                            best_cost = f_curr
+                            best_ds   = ds_current.copy()
+                        blk_hist.append(best_cost)
+                    all_hist.append(np.array(blk_hist))
 
                     is_last = (blk_idx == n_blocks - 1)
-
                     if not is_last:
-                        # Solve QP → exact alpha + normals → geometrically correct reftrack
-                        alpha_m, normvec = self._solve_alpha(ds_opt)
+                        # Use best_ds (not last iterate) to build the refined track
+                        alpha_m, normvec = self._solve_alpha(best_ds)
                         reftrack_refined = self._build_refined_reftrack(alpha_m, normvec)
                         self._update_reftrack(reftrack_refined)
-                        ds_current = self.lengths.copy()   # new initial ds for next block
+                        ds_current = self.lengths.copy()
+                        f_curr     = self.f_t(ds_current)
+                        # Reset best for the new track
+                        best_ds    = ds_current.copy()
+                        best_cost  = f_curr
+                        all_hist.append(np.array([f_curr]))  # cost at start of new block
                         print(f"  [path refine {blk_idx + 1}/{n_refinements}] "
                               f"{reftrack_refined.shape[0]} ctrl pts  |  "
-                              f"laptime ≈ {self.f_t(ds_current):.3f} s")
-                    else:
-                        ds_current = ds_opt   # final optimised result on current track
+                              f"laptime ≈ {f_curr:.3f} s")
 
-                return ds_current
+                history = np.concatenate(all_hist)
+                self.ds_opt     = best_ds
+                self.ds_history = history
+                return best_ds, history
 
+        # ====================================================================
+        # CMA-ES solver
+        # ====================================================================
         if solver == 'CMA':
             if not use_refinement:
                 # ----------------------------------------------------------------
-                # Original behaviour: MC runs, no path refinement
+                # Standard mode: MC independent runs, best tracked globally
                 # ----------------------------------------------------------------
-                mean = self.lengths.copy()
-                s_cmaa = np.zeros_like(mean)
+                mean    = self.lengths.copy()
+                f_start = self.f_t(mean)
+                best_ds   = mean.copy()
+                best_cost = f_start
+                history   = np.full(self.MC * self.iterations_CMA + 1, np.nan)
+                history[0] = f_start
+
+                hist_idx = 0
                 for _ in range(self.MC):
-                    cma_es_s = ConstrainedCMAES_t(
-                        self.f_t, mean, self.sigma, self.popsize,
-                        bounds1=np.ones_like(self.lengths) * self.max_s,
-                        bounds2=np.ones_like(self.lengths) * self.min_s)
-                    s_cmai = cma_es_s.optimize(iterations=self.iterations_CMA)
-                    s_cmaa += s_cmai
-                return s_cmaa / self.MC
+                    _best = {'ds': best_ds.copy(), 'cost': best_cost}
+
+                    def _tracked(ds):
+                        c = self.f_t(ds)
+                        if c < _best['cost']:
+                            _best['cost'] = c
+                            _best['ds']   = ds.copy()
+                        return c
+
+                    cma = ConstrainedCMAES_t(
+                        _tracked, mean.copy(), self.sigma, self.popsize,
+                        bounds1=np.ones_like(mean) * self.max_s,
+                        bounds2=np.ones_like(mean) * self.min_s)
+                    cma.iterations = 0
+
+                    for gen in range(self.iterations_CMA):
+                        samples = cma.sample_population()
+                        fitness = np.array([cma.objective_function(s) for s in samples])
+                        cma.update(samples, fitness)
+                        cma.iterations += 1
+                        hist_idx += 1
+                        history[hist_idx] = _best['cost']
+
+                    if _best['cost'] < best_cost:
+                        best_cost = _best['cost']
+                        best_ds   = _best['ds'].copy()
+
+                self.ds_opt     = best_ds
+                self.ds_history = history
+                return best_ds, history
 
             else:
                 # ----------------------------------------------------------------
-                # Refinement-aware loop (mirrors the ZO logic)
+                # Refinement-aware CMA loop
                 # ----------------------------------------------------------------
                 if self.MC > 1:
                     print("WARNING [CurveLenOpt]: MC > 1 is not supported with path "
@@ -984,38 +1067,70 @@ class Opt_min_CurvTime:
 
                 # Partition total CMA iterations into blocks of q.
                 # Refinement happens BETWEEN blocks, not after the final block.
-                n_full = self.iterations_CMA // q
-                rem    = self.iterations_CMA % q
+                n_full     = self.iterations_CMA // q
+                rem        = self.iterations_CMA % q
                 all_blocks = [q] * n_full
                 if rem > 0:
                     all_blocks.append(rem)
-                n_blocks = len(all_blocks)
+                n_blocks      = len(all_blocks)
                 n_refinements = n_blocks - 1
 
                 ds_current = self.lengths.copy()
+                f_curr     = self.f_t(ds_current)
+                best_ds    = ds_current.copy()
+                best_cost  = f_curr
+                all_hist   = [np.array([f_curr])]  # history[0] = initial cost
 
                 for blk_idx, blk_iters in enumerate(all_blocks):
-                    cma_es_s = ConstrainedCMAES_t(
-                        self.f_t, ds_current, self.sigma, self.popsize,
+                    _best = {'ds': best_ds.copy(), 'cost': best_cost}
+
+                    def _tracked(ds):
+                        c = self.f_t(ds)
+                        if c < _best['cost']:
+                            _best['cost'] = c
+                            _best['ds']   = ds.copy()
+                        return c
+
+                    cma = ConstrainedCMAES_t(
+                        _tracked, ds_current.copy(), self.sigma, self.popsize,
                         bounds1=np.ones_like(ds_current) * self.max_s,
                         bounds2=np.ones_like(ds_current) * self.min_s)
-                    ds_opt = cma_es_s.optimize(iterations=blk_iters)
+                    cma.iterations = 0
+
+                    blk_hist = []
+                    for gen in range(blk_iters):
+                        samples = cma.sample_population()
+                        fitness = np.array([cma.objective_function(s) for s in samples])
+                        cma.update(samples, fitness)
+                        cma.iterations += 1
+                        blk_hist.append(_best['cost'])
+                    all_hist.append(np.array(blk_hist))
+
+                    if _best['cost'] < best_cost:
+                        best_cost = _best['cost']
+                        best_ds   = _best['ds'].copy()
+                    ds_current = cma.mean.copy()
 
                     is_last = (blk_idx == n_blocks - 1)
-
                     if not is_last:
-                        # Solve QP → exact alpha + normals → geometrically correct reftrack
-                        alpha_m, normvec = self._solve_alpha(ds_opt)
+                        # Use best_ds (not CMA mean) to build the refined track
+                        alpha_m, normvec = self._solve_alpha(best_ds)
                         reftrack_refined = self._build_refined_reftrack(alpha_m, normvec)
                         self._update_reftrack(reftrack_refined)
-                        ds_current = self.lengths.copy()   # new initial mean for next block
+                        ds_current = self.lengths.copy()
+                        f_curr     = self.f_t(ds_current)
+                        # Reset best for the new track
+                        best_ds    = ds_current.copy()
+                        best_cost  = f_curr
+                        all_hist.append(np.array([f_curr]))  # cost at start of new block
                         print(f"  [path refine {blk_idx + 1}/{n_refinements}] "
                               f"{reftrack_refined.shape[0]} ctrl pts  |  "
-                              f"laptime ≈ {self.f_t(ds_current):.3f} s")
-                    else:
-                        ds_current = ds_opt   # final optimised result on current track
+                              f"laptime ≈ {f_curr:.3f} s")
 
-                return ds_current
+                history = np.concatenate(all_hist)
+                self.ds_opt     = best_ds
+                self.ds_history = history
+                return best_ds, history
 
     def generate_raceline(self, ds=None, solver='ZO', refine_every=None):
         """
@@ -1046,7 +1161,7 @@ class Opt_min_CurvTime:
         """
 
         if ds is None:
-            ds = self.CurveLenOpt(solver=solver, refine_every=refine_every)
+            ds, _ = self.CurveLenOpt(solver=solver, refine_every=refine_every)
 
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((self.reftrack[:, 0:2], self.reftrack[0, 0:2])),el_lengths=ds)
         H, f, G , h = H_f(reftrack=self.reftrack,
@@ -1055,7 +1170,7 @@ class Opt_min_CurvTime:
                                                  kappa_bound=self.kapb,
                                                  w_veh=2*self.sfty,
                                                  closed=True)
-                                                 
+
 
         alpha_m_s = quadprog.solve_qp(H, -f, -G.T,-h,0)[0]
         raceline_interp, a_opt, coeffs_x_opt, coeffs_y_opt, spline_inds_opt_interp, t_vals_opt_interp, s_points_opt_interp,\
@@ -1103,7 +1218,7 @@ class Opt_min_CurvTime:
         """
 
         if ds is None:
-            ds = self.CurveLenOpt(solver=solver, refine_every=refine_every)
+            ds, _ = self.CurveLenOpt(solver=solver, refine_every=refine_every)
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((self.reftrack[:, 0:2], self.reftrack[0, 0:2])),el_lengths=ds)
         H, f, G , h = H_f(reftrack=self.reftrack,
                                                  normvectors=normvec_norm,
@@ -1190,14 +1305,14 @@ class Opt_min_CurvTime:
         # ---- ZO (run from original base track; refinement optional) ----
         self._update_reftrack(self._base_reftrack.copy())
         if ds_ZO is None:
-            ds_ZO = self.CurveLenOpt(solver='ZO', refine_every=refine_every)
+            ds_ZO, _ = self.CurveLenOpt(solver='ZO', refine_every=refine_every)
         s_splines, vx_profile_opt, ax_profile_opt, kappa_opt, t_profile_cl, raceline_interp = \
             self.generate_kinProfs(ds=ds_ZO)
 
         # ---- CMA (always from original base track, no refinement) ----
         self._update_reftrack(self._base_reftrack.copy())
         if ds_CMA is None:
-            ds_CMA = self.CurveLenOpt(solver='CMA')
+            ds_CMA, _ = self.CurveLenOpt(solver='CMA')
         s_splines1, vx_profile_opt1, ax_profile_opt1, kappa_opt1, t_profile_cl1, raceline_interp1 = \
             self.generate_kinProfs(ds=ds_CMA)
 
@@ -1561,13 +1676,14 @@ class Blackbox_raceline:
                 "Reduce sfty or check track widths.")
 
         # ---- fixed normal vectors (computed once from initial Euclidean ds) ----
-        ds_init = np.hypot(
-            np.diff(np.r_[reftrack[:, 0], reftrack[0, 0]]),
-            np.diff(np.r_[reftrack[:, 1], reftrack[0, 1]]))
+        # Convention must match ShortestPath / Opt_min_CurvTime / run_mc:
+        # compute N-1 inter-point distances then append ds_init[0] as the closing
+        # segment proxy, NOT the actual wrap-around distance (reftrack[-1]→reftrack[0]).
+        ds_init = np.sqrt(np.sum(np.power(np.diff(reftrack[:, :2], axis=0), 2), axis=1))
+        ds_init = np.append(ds_init, ds_init[0])
         _, _, self._M, self._normvec = calc_splines(
             path=np.vstack((reftrack[:, :2], reftrack[0, :2])),
-            el_lengths=ds_init,
-            use_dist_scaling=True)
+            el_lengths=ds_init)
 
         # ---- p_ggv cache (keyed by interpolated raceline length) ---------------
         self._p_ggv_cache: dict = {}
@@ -1619,7 +1735,7 @@ class Blackbox_raceline:
                 closed=True)
             alpha_mc = quadprog.solve_qp(H, -f_vec, -G.T, -h_vec, 0)[0]
             # Clip in case QP and Blackbox box constraints differ by a rounding epsilon
-            return np.clip(alpha_mc, self.lo, self.hi)
+            return alpha_mc
 
         elif self.init in ('shortest', 'shortest_path', 'sp'):
             # Warm-start from the OSP (Optimal Shortest Path) QP solution.
@@ -1633,7 +1749,7 @@ class Blackbox_raceline:
             alpha_sp = quadprog.solve_qp(H_sp, -f_sp, -G_sp.T, -h_sp, 0)[0]
             # Clip to Blackbox box (OSP and H_f constraints can differ slightly
             # due to numerical tolerances or rounding in dev_max).
-            return np.clip(alpha_sp, self.lo, self.hi)
+            return alpha_sp
 
         else:
             raise ValueError(
