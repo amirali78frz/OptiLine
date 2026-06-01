@@ -918,7 +918,7 @@ class Opt_min_CurvTime:
                         grad_sum = np.zeros_like(ds)
                         for _ in range(self.t):
                             u      = np.random.randn(len(ds))
-                            ds_fwd = np.clip(ds + self.mu * u, self.min_s, self.max_s)
+                            ds_fwd = ds + self.mu * u
                             f_fwd  = self.f_t(ds_fwd)
                             grad_sum += (f_fwd - f_curr) / self.mu * u
                         # projected gradient step; evaluate new iterate
