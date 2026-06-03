@@ -287,7 +287,7 @@ optct = solvers.Opt_min_CurvTime(
     mu=0.01,
     h=0.001,
     kapb=0.5,                # curvature bound [rad/m]
-    sfty=1.0,                # half vehicle width [m]
+    sfty=0.5,                # half vehicle width [m]
     t=1,                     # number of sampled directions for gradient estimation
     si=2,                    # interpolation stepsize [m]
     vm=22.88,                # maximum velocity [m/s]
@@ -314,6 +314,9 @@ t0 = time.time()
 raceline_zo, ds_zo = optct.generate_raceline(solver='ZO')
 print(f"generate_raceline (ZO) done in {time.time()-t0:.2f} s, "
       f"points: {raceline_zo.shape[0]}")
+hist_zo = optct.ds_history
+print(f"  ZO history: initial={hist_zo[0]:.4f} s  best={hist_zo[-1]:.4f} s  "
+      f"improvement={hist_zo[0]-hist_zo[-1]:.4f} s")
 
 # --- 7b: generate_kinProfs – full profiles using ZO-optimized lengths ---
 t0 = time.time()
@@ -372,7 +375,7 @@ optct_ref = solvers.Opt_min_CurvTime(
     mu=0.01,
     h=0.001,
     kapb=0.5,
-    sfty=1.0,
+    sfty=0.5,
     t=1,
     si=2,
     vm=22.88,
@@ -396,7 +399,9 @@ print("\n  A. ZO – no refinement")
 t0 = time.time()
 s_a, vx_a, ax_a, kappa_a, t_a, rl_a = optct_ref.generate_kinProfs(
     solver='ZO', refine_every=0)
-print(f"     Done in {time.time()-t0:.1f} s  |  laptime = {t_a[-1]:.2f} s")
+hist_a = optct_ref.ds_history
+print(f"     Done in {time.time()-t0:.1f} s  |  laptime = {t_a[-1]:.2f} s  "
+      f"|  best = {hist_a[-1]:.4f} s  improvement = {hist_a[0]-hist_a[-1]:.4f} s")
 optct_ref.reset()   # restore original track for the next variant
 
 # ---- B : ZO with in-loop refinement ----
@@ -405,7 +410,9 @@ print(f"\n  B. ZO – refine every {REFINE_Q_ZO} iters  (sub-sample stride {REFI
 t0 = time.time()
 s_b, vx_b, ax_b, kappa_b, t_b, rl_b = optct_ref.generate_kinProfs(solver='ZO')
 n_ctrl_b = optct_ref.reftrack.shape[0]
+hist_b = optct_ref.ds_history
 print(f"     Done in {time.time()-t0:.1f} s  |  laptime = {t_b[-1]:.2f} s  "
+      f"|  best = {hist_b[-1]:.4f} s  "
       f"|  final ctrl pts: {n_ctrl_b}  (was {reftrack.shape[0]})")
 optct_ref.reset()
 
@@ -416,7 +423,9 @@ t0 = time.time()
 s_c, vx_c, ax_c, kappa_c, t_c, rl_c = optct_ref.generate_kinProfs(
     solver='CMA', refine_every=REFINE_Q_CMA)
 n_ctrl_c = optct_ref.reftrack.shape[0]
+hist_c = optct_ref.ds_history
 print(f"     Done in {time.time()-t0:.1f} s  |  laptime = {t_c[-1]:.2f} s  "
+      f"|  best = {hist_c[-1]:.4f} s  "
       f"|  final ctrl pts: {n_ctrl_c}")
 optct_ref.reset()
 
@@ -424,12 +433,27 @@ t_elapsed = time.time() - t_start
 
 # ---- Results table ----
 col = 44
-print(f"\n  {'Variant':<{col}} {'Laptime (s)':>11}")
-print(f"  {'-' * (col + 12)}")
-print(f"  {'A.  ZO  – no refinement (150 iters)':<{col}} {t_a[-1]:>11.2f}")
-print(f"  {'B.  ZO  – refine every ' + str(REFINE_Q_ZO)  + ' iters (150 iters)':<{col}} {t_b[-1]:>11.2f}")
-print(f"  {'C.  CMA – refine every ' + str(REFINE_Q_CMA) + ' iters ( 15 iters)':<{col}} {t_c[-1]:>11.2f}")
+print(f"\n  {'Variant':<{col}} {'Laptime (s)':>11} {'Best hist (s)':>14}")
+print(f"  {'-' * (col + 27)}")
+print(f"  {'A.  ZO  – no refinement (150 iters)':<{col}} {t_a[-1]:>11.2f} {hist_a[-1]:>14.4f}")
+print(f"  {'B.  ZO  – refine every ' + str(REFINE_Q_ZO)  + ' iters (150 iters)':<{col}} {t_b[-1]:>11.2f} {hist_b[-1]:>14.4f}")
+print(f"  {'C.  CMA – refine every ' + str(REFINE_Q_CMA) + ' iters ( 15 iters)':<{col}} {t_c[-1]:>11.2f} {hist_c[-1]:>14.4f}")
 print(f"\n  Stage 7 total time : {t_elapsed:.1f} s")
+
+# ---- Convergence history plot (new) ----
+plt.figure(figsize=(8, 4))
+plt.suptitle("Stage 7 – CurveLenOpt convergence history (best-so-far)")
+x_a = np.arange(len(hist_a))
+x_b = np.arange(len(hist_b))
+x_c = np.arange(len(hist_c))
+plt.plot(x_a, hist_a, 'g-',  lw=1.2, label=f'A: ZO no refine  (best={hist_a[-1]:.3f} s)')
+plt.plot(x_b, hist_b, 'r.-', lw=1.2, label=f'B: ZO refine/{REFINE_Q_ZO}  (best={hist_b[-1]:.3f} s)')
+plt.plot(x_c, hist_c, 'm--', lw=1.2, label=f'C: CMA refine/{REFINE_Q_CMA}  (best={hist_c[-1]:.3f} s)')
+plt.xlabel('History index (step / generation)')
+plt.ylabel('Best-so-far lap time [s]')
+plt.legend(fontsize=9); plt.grid(True)
+plt.tight_layout()
+plt.show()
 
 # ---- Plots ----
 plt.figure(figsize=(14, 5))
@@ -488,8 +512,8 @@ BB_SI        = 2.0     # raceline interpolation stepsize [m]
 BB_FW        = 3       # velocity-profile filter window
 BB_M         = 1000    # vehicle mass [kg]
 BB_DRAG      = 0.75    # aerodynamic drag coefficient
-BB_MU        = 0.001    # ZO perturbation magnitude μ
-BB_H         = 0.0001   # ZO gradient-step size h
+BB_MU        = 0.0001    # ZO perturbation magnitude μ
+BB_H         = 0.00005   # ZO gradient-step size h
 BB_T         = 5       # ZO directions averaged per estimate
 BB_ITERS_ZO  = 360      # ZO gradient steps
 BB_ITERS_CMA = 15      # CMA-ES generations
@@ -520,7 +544,7 @@ for mode in init_modes:
           f"alpha in [{_bb.alpha_0.min():.4f}, {_bb.alpha_0.max():.4f}]")
 
 # ---------------------------------------------------------------------------
-# 8b: ZO optimizer on all three init modes
+# 8b: ZO optimizer on all four init modes
 # ---------------------------------------------------------------------------
 print(f"\n--- 8b: ZO optimizer ({BB_ITERS_ZO} iters, oracle='gaussian') ---")
 
