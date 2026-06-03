@@ -21,3 +21,5 @@ This document explains:
 - Usage examples
 - Track and GGV formats
 
+➡️ [Test files](tests/)
+To gain a better understanding of how to use the package, please review the provided test files.
