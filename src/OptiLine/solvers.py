@@ -1824,6 +1824,7 @@ class Blackbox_raceline:
         seed: int = None,
         verbose: bool = True,
         print_every: int = 50,
+        feasible_eval: bool = False,
     ):
         """
         Minimize the cost over alpha using either ZO gradient descent or CMA-ES.
@@ -1865,6 +1866,9 @@ class Blackbox_raceline:
             Print progress every ``print_every`` iterations/generations.
         print_every : int
             Verbosity interval.
+        feasible_eval : bool
+            If True, all the points in function evaluations (including perturbations) are projected onto the feasible box before evaluation.
+            This can be useful for debugging or if the cost function is only defined within the feasible region.  By default, the ZO solver evaluates the raw (potentially infeasible) perturbations
 
         Returns
         -------
@@ -1909,14 +1913,19 @@ class Blackbox_raceline:
                 grad_sum = np.zeros(self.N)
                 for _ in range(t_dirs):
                     u = self._sample_direction()
-
-                    alpha_fwd = np.clip(alpha + mu * u, self.lo, self.hi)
+                    if feasible_eval:
+                        alpha_fwd = np.clip(alpha + mu * u, self.lo, self.hi)
+                    else:
+                        alpha_fwd = alpha + mu * u
                     f_fwd     = self._eval_cost(alpha_fwd)
 
                     if grad_type == 'noth':
                         g = (f_fwd - f_curr) / mu * u
                     else:                              # 'h' = central difference
-                        alpha_bwd = np.clip(alpha - mu * u, self.lo, self.hi)
+                        if feasible_eval:
+                            alpha_bwd = np.clip(alpha - mu * u, self.lo, self.hi)
+                        else:
+                            alpha_bwd = alpha - mu * u
                         f_bwd     = self._eval_cost(alpha_bwd)
                         g = (f_fwd - f_bwd) / (2.0 * mu) * u
 
