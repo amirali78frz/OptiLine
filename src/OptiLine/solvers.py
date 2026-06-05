@@ -329,8 +329,9 @@ class ConstrainedCMAES_t:
         - popsize: Population size.
         - bounds1: Upper bounds.
         - bounds2: Lower bounds.
+        - projection_fn: Function to project alpha onto the feasible set.
     """
-    def __init__(self, f_t,mean, sigma, popsize, bounds1=None, bounds2=None):
+    def __init__(self, f_t,mean, sigma, popsize, bounds1=None, bounds2=None, project_fn=None):
         self.mean = np.array(mean)
         self.sigma = sigma
         self.popsize = popsize
@@ -339,6 +340,7 @@ class ConstrainedCMAES_t:
         self.bounds1 = bounds1
         self.bounds2 = bounds2
         self.ft = f_t
+        self.project_fn = project_fn
         # CMA-ES parameters
         self.weights = np.log(self.popsize/2 + 1) - np.log(np.arange(1, self.popsize + 1))
         self.weights[self.weights < 0] = 0
@@ -375,6 +377,8 @@ class ConstrainedCMAES_t:
         samples = np.random.multivariate_normal(self.mean, self.sigma**2 * self.cov_matrix, self.popsize)
         if self.bounds1 is not None:
             samples = np.clip(samples, self.bounds2, self.bounds1)
+        else:
+            samples = self.project_fn(samples)
         return samples
 
     def objective_function(self, ds):
@@ -1581,6 +1585,9 @@ class Blackbox_raceline:
     cost_fn : callable or None
         User-supplied cost function ``cost_fn(alpha) -> float``.
         If None the default lap-time oracle is used.
+    Projection_fn : callable or None
+        Function to project alpha onto the feasible set.
+        If None, the default box projection is used.
     init : str
         Initial alpha strategy.
 
@@ -1619,6 +1626,7 @@ class Blackbox_raceline:
         drag_coeff: float = 0.0,
         dyn_model_exp: float = 1.0,
         cost_fn=None,
+        Projection_fn=None,
         init: str = 'random',
         oracle: str = 'gaussian',
         mu: float = 0.05,
@@ -1650,6 +1658,7 @@ class Blackbox_raceline:
         self.grad_type     = grad_type
         self.iterations    = iterations
         self.kappa_bound   = kappa_bound
+        self.Projection_fn = Projection_fn
 
         if seed is not None:
             np.random.seed(seed)
@@ -1765,6 +1774,12 @@ class Blackbox_raceline:
         if self.cost_fn is not None:
             return float(self.cost_fn(alpha))
         return self._laptime_cost(alpha)
+    
+    def _project_alpha(self, alpha: np.ndarray) -> np.ndarray:
+        """Project alpha onto the feasible box (dispatch to user Projection_fn or default)."""
+        if self.Projection_fn is not None:
+            return self.Projection_fn(alpha)
+        return np.clip(alpha, self.lo, self.hi)
 
     def _laptime_cost(self, alpha: np.ndarray) -> float:
         """
@@ -1914,7 +1929,7 @@ class Blackbox_raceline:
                 for _ in range(t_dirs):
                     u = self._sample_direction()
                     if feasible_eval:
-                        alpha_fwd = np.clip(alpha + mu * u, self.lo, self.hi)
+                        alpha_fwd = self._project_alpha(alpha + mu * u)
                     else:
                         alpha_fwd = alpha + mu * u
                     f_fwd     = self._eval_cost(alpha_fwd)
@@ -1923,7 +1938,7 @@ class Blackbox_raceline:
                         g = (f_fwd - f_curr) / mu * u
                     else:                              # 'h' = central difference
                         if feasible_eval:
-                            alpha_bwd = np.clip(alpha - mu * u, self.lo, self.hi)
+                            alpha_bwd = self._project_alpha(alpha - mu * u)
                         else:
                             alpha_bwd = alpha - mu * u
                         f_bwd     = self._eval_cost(alpha_bwd)
@@ -1934,7 +1949,7 @@ class Blackbox_raceline:
                 grad_est = grad_sum / t_dirs
 
                 # projected gradient step
-                alpha  = np.clip(alpha - step_size * grad_est, self.lo, self.hi)
+                alpha  = self._project_alpha(alpha - step_size * grad_est)
                 f_curr = self._eval_cost(alpha)
 
                 if f_curr < best_cost:
@@ -1972,8 +1987,7 @@ class Blackbox_raceline:
                 mean=alpha_start.copy(),
                 sigma=sigma,
                 popsize=popsize,
-                bounds1=self.hi,
-                bounds2=self.lo)
+                project_fn=self._project_alpha)
             # ConstrainedCMAES_t.update() references self.iterations (normally
             # set inside optimize()).  We manage the loop ourselves for
             # best-tracking, so we must initialise it here.
