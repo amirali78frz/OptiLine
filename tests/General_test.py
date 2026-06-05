@@ -516,7 +516,7 @@ BB_MU        = 0.0001    # ZO perturbation magnitude μ
 BB_H         = 0.00005   # ZO gradient-step size h
 BB_T         = 5       # ZO directions averaged per estimate
 BB_ITERS_ZO  = 360      # ZO gradient steps
-BB_ITERS_CMA = 15      # CMA-ES generations
+BB_ITERS_CMA = 36      # CMA-ES generations
 BB_SIGMA     = 0.01    # CMA-ES initial step size σ
 BB_POPSIZE   = 20      # CMA-ES population size
 
