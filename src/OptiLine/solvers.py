@@ -651,9 +651,8 @@ class Opt_min_CurvTime:
         self.m_veh=m_veh
         self.drag_coeff=drag_coeff
         self.center=center
-        lengths = np.sqrt(np.sum(np.power(np.diff(self.reftrack[:,0:2], axis=0), 2), axis=1))
-        lengths=np.append(lengths, lengths[0])
-        self.lengths=lengths
+        lengths = np.sqrt(np.sum(np.power(np.diff(np.vstack((self.reftrack[:,0:2], self.reftrack[0,0:2])), axis=0), 2), axis=1))
+        self.lengths = lengths
         self.ggv,self.ax_max_machines =import_veh_dyn_info(ggv_import_path=self.ggv_import_path,ax_max_machines_import_path=self.ax_max_machines_import_path)
         # Pre-built p_ggv cache keyed by kappa array size (size is approx constant across f_t calls)
         self._p_ggv_cache = {}
@@ -701,9 +700,7 @@ class Opt_min_CurvTime:
         :type reftrack_new:     np.ndarray
         """
         self.reftrack = reftrack_new
-        lengths = np.sqrt(np.sum(
-            np.power(np.diff(reftrack_new[:, 0:2], axis=0), 2), axis=1))
-        lengths = np.append(lengths, lengths[0])
+        lengths = np.sqrt(np.sum(np.power(np.diff(np.vstack((reftrack_new[:,0:2], reftrack_new[0,0:2])), axis=0), 2), axis=1))
         self.lengths = lengths
         self.min_s = float(np.min(lengths))
         self.max_s = float(np.max(lengths)) * 1.7
@@ -1320,8 +1317,9 @@ class Opt_min_CurvTime:
 
 
         ##Calculate the profiles for centerline
-        lengths1 = np.sqrt(np.sum(np.power(np.diff(self.center[:,0:2], axis=0), 2), axis=1))
-        lengths1=np.append(lengths1, lengths1[0])
+        lengths1 = np.sqrt(np.sum(np.power(np.diff(np.vstack((self.center[:,0:2], self.center[0,0:2])), axis=0), 2), axis=1))
+        # lengths1 = np.sqrt(np.sum(np.power(np.diff(self.center[:,0:2], axis=0), 2), axis=1))
+        # lengths1=np.append(lengths1, lengths1[0])
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((self.center[:, 0:2], self.center[0, 0:2])),el_lengths=lengths1)
         H, f, G , h = H_f(reftrack=self.center,
                                                  normvectors=normvec_norm,
@@ -1680,8 +1678,11 @@ class Blackbox_raceline:
         # Convention must match ShortestPath / Opt_min_CurvTime / run_mc:
         # compute N-1 inter-point distances then append ds_init[0] as the closing
         # segment proxy, NOT the actual wrap-around distance (reftrack[-1]→reftrack[0]).
-        ds_init = np.sqrt(np.sum(np.power(np.diff(reftrack[:, :2], axis=0), 2), axis=1))
-        ds_init = np.append(ds_init, ds_init[0])
+        lengths = np.sqrt(np.sum(np.power(np.diff(np.vstack((self.reftrack[:,0:2], self.reftrack[0,0:2])), axis=0), 2), axis=1))
+        
+        ds_init = lengths.copy()
+        # ds_init = np.sqrt(np.sum(np.power(np.diff(reftrack[:, :2], axis=0), 2), axis=1))
+        # ds_init = np.append(ds_init, ds_init[0])
         _, _, self._M, self._normvec = calc_splines(
             path=np.vstack((reftrack[:, :2], reftrack[0, :2])),
             el_lengths=ds_init)
@@ -2367,9 +2368,9 @@ def ShortestPath(reftrack: np.ndarray,
     :return t_profile_cl:       cumulative lap time profile in seconds.
     :rtype t_profile_cl:        np.ndarray
     """
-
-    lengths = np.sqrt(np.sum(np.power(np.diff(reftrack[:,0:2], axis=0), 2), axis=1))
-    lengths=np.append(lengths, lengths[0])
+    lengths = np.sqrt(np.sum(np.power(np.diff(np.vstack((reftrack[:,0:2], reftrack[0,0:2])), axis=0), 2), axis=1))
+    # lengths = np.sqrt(np.sum(np.power(np.diff(reftrack[:,0:2], axis=0), 2), axis=1))
+    # lengths=np.append(lengths, lengths[0])
     coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((reftrack[:, 0:2], reftrack[0, 0:2])),el_lengths=lengths)
     H, f, G , h = OSP(reftrack=reftrack,
                     normvectors=normvec_norm,
