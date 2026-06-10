@@ -91,10 +91,11 @@ reftrack = subsample_track(reftrack_full, step=4)
 print(f"Full track points : {reftrack_full.shape[0]}")
 print(f"Subsampled points : {reftrack.shape[0]}")
 
-# Compute initial segment lengths (Euclidean distances between consecutive points)
-lengths = np.sqrt(np.sum(np.diff(reftrack[:, 0:2], axis=0) ** 2, axis=1))
-lengths = np.append(lengths, lengths[0])   # close the loop
-ds_0 = lengths
+# Compute initial segment lengths using np.vstack to include the actual closing
+# segment (reftrack[-1] -> reftrack[0]), consistent with Blackbox_raceline.__init__
+# and ShortestPath — both use the same np.vstack convention.
+ds_0 = np.sqrt(np.sum(np.power(
+    np.diff(np.vstack((reftrack[:, 0:2], reftrack[0, 0:2])), axis=0), 2), axis=1))
 
 print(f"Segment length range : [{ds_0.min():.3f}, {ds_0.max():.3f}] m")
 
@@ -116,7 +117,6 @@ print_stage(2, "Spline computations (utils)")
 coeffs_x, coeffs_y, M, normvec_norm = calc_splines(
     path=np.vstack((reftrack[:, 0:2], reftrack[0, 0:2])),  # closed path
     el_lengths=ds_0,
-    use_dist_scaling=True,
 )
 print(f"Spline coeff matrices : coeffs_x {coeffs_x.shape}, coeffs_y {coeffs_y.shape}")
 print(f"System matrix M       : {M.shape}")
@@ -506,7 +506,7 @@ t9_start = time.time()
 # Keep iteration counts small so the script finishes in a reasonable time;
 # increase BB_ITERS_ZO / BB_ITERS_CMA for production-quality results.
 # ---------------------------------------------------------------------------
-BB_SFTY      = 0.2     # safety half-width [m] (same as Opt_min_CurvTime)
+BB_SFTY      = 0.5     # safety half-width [m] (same as Opt_min_CurvTime)
 BB_VM        = 22.88   # maximum velocity [m/s]
 BB_SI        = 2.0     # raceline interpolation stepsize [m]
 BB_FW        = 3       # velocity-profile filter window
@@ -514,9 +514,9 @@ BB_M         = 1000    # vehicle mass [kg]
 BB_DRAG      = 0.75    # aerodynamic drag coefficient
 BB_MU        = 0.0001    # ZO perturbation magnitude μ
 BB_H         = 0.00005   # ZO gradient-step size h
-BB_T         = 5       # ZO directions averaged per estimate
-BB_ITERS_ZO  = 360      # ZO gradient steps
-BB_ITERS_CMA = 36      # CMA-ES generations
+BB_T         = 2       # ZO directions averaged per estimate
+BB_ITERS_ZO  = 100      # ZO gradient steps
+BB_ITERS_CMA = 10      # CMA-ES generations
 BB_SIGMA     = 0.01    # CMA-ES initial step size σ
 BB_POPSIZE   = 20      # CMA-ES population size
 
@@ -661,7 +661,7 @@ bb_custom = solvers.Blackbox_raceline(
     mu=BB_MU, h=BB_H, t=BB_T,
     iterations=BB_ITERS_ZO,
     cost_fn=custom_cost,
-    seed=None)
+    seed=None, n_jobs=12)
 t0 = time.time()
 best_custom, hist_custom = bb_custom.find_alpha(
     solver='ZO', n_iter=BB_ITERS_ZO,
@@ -991,6 +991,110 @@ print(f"Stage 8 total time : {time.time()-t9_start:.1f} s")
 
 
 # ===========================================================================
+# Stage 9 – Blackbox_raceline: parallel speedup (n_jobs > 1)
+#
+# ProcessPoolExecutor sends reftrack/ggv/normvec to each worker once
+# (via initializer), then only serialises the small alpha vector per call.
+# This avoids GIL limitations inside calc_vel_profile's Python loops.
+#
+# ZO  with grad_type='h' (central diff) and t=T_PAR_ZO:
+#   evaluates 2*T_PAR_ZO points per gradient step in parallel.
+# CMA with popsize=POPSIZE_PAR:
+#   evaluates POPSIZE_PAR points per generation in parallel.
+# ===========================================================================
+print_stage(9, "Blackbox_raceline – parallel speedup (n_jobs > 1)")
+
+import os as _os
+
+N_JOBS_PAR    = _os.cpu_count() or 4
+SEED_PAR      = 42
+T_PAR_ZO      = 10        # ZO directions per step 
+POPSIZE_PAR   = 20       # CMA population → 20 parallel evals per generation
+ITERS_PAR_ZO  = 30       # ZO gradient steps
+ITERS_PAR_CMA = 15       # CMA generations
+
+print(f"\n  CPU cores available : {N_JOBS_PAR}")
+print(f"  ZO  : {ITERS_PAR_ZO} iters, t={T_PAR_ZO} dirs, central diff  "
+      f"-> {T_PAR_ZO+1} evals/step in parallel")
+print(f"  CMA : {ITERS_PAR_CMA} gens, popsize={POPSIZE_PAR}  "
+      f"-> {POPSIZE_PAR} evals/gen in parallel\n")
+
+par_timing  = {}   # (solver, n_jobs) -> elapsed seconds
+par_results = {}   # (solver, n_jobs) -> best laptime
+
+for solver_par, n_iter_par, extra_par in [
+    ('ZO',  ITERS_PAR_ZO,  dict(t=T_PAR_ZO, grad_type='noth')),
+    ('CMA', ITERS_PAR_CMA, dict(popsize=POPSIZE_PAR)),
+]:
+    for n_jobs_par in [1, N_JOBS_PAR]:
+        bb_par = solvers.Blackbox_raceline(
+            reftrack=reftrack, ggv=ggv, ax_max_machines=ax_max_machines,
+            sfty=BB_SFTY, v_max=BB_VM, si=BB_SI, fw=BB_FW,
+            m_veh=BB_M, drag_coeff=BB_DRAG,
+            init='mincurv', oracle='gaussian',
+            mu=BB_MU, h=BB_H,
+            iterations=n_iter_par, seed=SEED_PAR,n_jobs=n_jobs_par)
+
+        t0_par = time.time()
+        best_a_par, hist_par = bb_par.find_alpha(
+            solver=solver_par, n_iter=n_iter_par, seed=SEED_PAR,
+            verbose=False, **extra_par)
+        elapsed_par = time.time() - t0_par
+
+        best_par = hist_par[~np.isnan(hist_par)].min()
+        par_timing[(solver_par, n_jobs_par)]  = elapsed_par
+        par_results[(solver_par, n_jobs_par)] = best_par
+        tag = f"{solver_par}/n_jobs={n_jobs_par}"
+        print(f"  {tag:<25}  time = {elapsed_par:6.1f} s   best laptime = {best_par:.4f} s")
+
+print(f"\n  {'Solver':<8} {'Serial (s)':>10} {'Parallel (s)':>13} {'Speedup':>9}")
+print(f"  {'-' * 44}")
+for s_par in ['ZO', 'CMA']:
+    t_ser_p = par_timing[(s_par, 1)]
+    t_par_p = par_timing[(s_par, N_JOBS_PAR)]
+    speedup_p = t_ser_p / t_par_p if t_par_p > 0 else float('inf')
+    same_result = abs(par_results[(s_par, 1)] - par_results[(s_par, N_JOBS_PAR)]) < 1e-9
+    note = " (identical result)" if same_result else " (stochastic variation)"
+    print(f"  {s_par:<8} {t_ser_p:>10.1f} {t_par_p:>13.1f} {speedup_p:>8.2f}x{note}")
+
+# -- Convergence history plot --
+fig9, axes9 = plt.subplots(1, 2, figsize=(13, 4))
+fig9.suptitle("Stage 9 - Parallel speedup: serial vs parallel (n_jobs=1 vs n_jobs={})".format(N_JOBS_PAR),
+              fontsize=11)
+
+for col_idx, (s_par, n_iter_par) in enumerate([('ZO', ITERS_PAR_ZO), ('CMA', ITERS_PAR_CMA)]):
+    ax9 = axes9[col_idx]
+    extra_plot = dict(t=T_PAR_ZO, grad_type='h') if s_par == 'ZO' else dict(popsize=POPSIZE_PAR)
+    for n_jobs_par, ls, lw in [(1, '-', 2.0), (N_JOBS_PAR, '--', 1.5)]:
+        bb_plot = solvers.Blackbox_raceline(
+            reftrack=reftrack, ggv=ggv, ax_max_machines=ax_max_machines,
+            sfty=BB_SFTY, v_max=BB_VM, si=BB_SI, fw=BB_FW,
+            m_veh=BB_M, drag_coeff=BB_DRAG,
+            init='mincurv', oracle='gaussian',
+            mu=BB_MU, h=BB_H, iterations=n_iter_par, seed=SEED_PAR)
+        _, h_plot = bb_plot.find_alpha(
+            solver=s_par, n_iter=n_iter_par, n_jobs=n_jobs_par,
+            seed=SEED_PAR, verbose=False, **extra_plot)
+        t_elapsed_plot = par_timing[(s_par, n_jobs_par)]
+        spd = par_timing[(s_par, 1)] / par_timing[(s_par, n_jobs_par)]
+        label = (f"n_jobs={n_jobs_par}  ({t_elapsed_plot:.1f}s)"
+                 if n_jobs_par == 1 else
+                 f"n_jobs={n_jobs_par}  ({t_elapsed_plot:.1f}s, {spd:.2f}x)")
+        ax9.plot(np.arange(len(h_plot)), h_plot, ls=ls, lw=lw, label=label)
+    ax9.set_xlabel("Iteration / Generation")
+    ax9.set_ylabel("Best-so-far lap time [s]")
+    ax9.set_title(f"{s_par} – serial vs parallel")
+    ax9.legend(fontsize=9)
+    ax9.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+t_stage9_total = sum(par_timing.values())
+print(f"\nStage 9 total time : {t_stage9_total:.1f} s  (serial + parallel, both solvers)")
+
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 print("\n" + "=" * 60)
@@ -1005,5 +1109,9 @@ print(f"  CMA stage 7C ( 15 iters, refine/{REFINE_Q_CMA})       : {t_c[-1]:.2f} 
 print(f"  BB / ZO best                               : {t_zo_bb[-1]:.2f} s  (direct alpha opt.)")
 print(f"  BB / CMA best                              : {t_cma_bb[-1]:.2f} s  (direct alpha opt.)")
 print(f"  BB / custom cost                           : {t_cust[-1]:.2f} s  (time + comfort)")
+zo_par_speedup  = par_timing[('ZO', 1)]  / par_timing[('ZO', N_JOBS_PAR)]
+cma_par_speedup = par_timing[('CMA', 1)] / par_timing[('CMA', N_JOBS_PAR)]
+print(f"  BB / ZO  parallel speedup ({N_JOBS_PAR} cores)       : {zo_par_speedup:.2f}x")
+print(f"  BB / CMA parallel speedup ({N_JOBS_PAR} cores)       : {cma_par_speedup:.2f}x")
 print("=" * 60)
 print("All stages completed successfully.")
