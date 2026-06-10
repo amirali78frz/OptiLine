@@ -3,6 +3,7 @@ import math
 import matplotlib.pyplot as plt
 import quadprog
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 
 def opt_min_curv(reftrack: np.ndarray,
@@ -584,6 +585,47 @@ class ZORM:
     
 from OptiLine.utils import calc_splines,create_raceline, calc_head_curv_an, H_f, import_veh_dyn_info
 from OptiLine.KinematicProfs import calc_vel_profile, calc_ax_profile, calc_t_profile , cumulative_distances
+
+# ---------------------------------------------------------------------------
+# Module-level worker state for ProcessPoolExecutor
+# (each worker process receives fixed data once via initializer)
+# ---------------------------------------------------------------------------
+_worker_context = None
+
+def _init_parallel_worker(ctx):
+    global _worker_context
+    _worker_context = ctx
+
+def _parallel_laptime_worker(alpha):
+    """Evaluate the default lap-time cost for a given alpha in a worker process."""
+    ctx = _worker_context
+    _, _, cx, cy, si_idx, tv, _, _, el = create_raceline(
+        refline=ctx['reftrack'][:, :2], normvectors=ctx['normvec'],
+        alpha=alpha, stepsize_interp=ctx['si'])
+    _, kappa = calc_head_curv_an(coeffs_x=cx, coeffs_y=cy, ind_spls=si_idx, t_spls=tv)
+    n = kappa.size
+    p_ggv = np.repeat(np.expand_dims(ctx['ggv'], axis=0), n, axis=0)
+    vx = calc_vel_profile(
+        ggv=ctx['ggv'], ax_max_machines=ctx['ax_max_machines'],
+        v_max=ctx['v_max'], kappa=kappa, el_lengths=el, closed=True,
+        filt_window=ctx['fw'], dyn_model_exp=ctx['dyn_model_exp'],
+        drag_coeff=ctx['drag_coeff'], m_veh=ctx['m_veh'], p_ggv=p_ggv)
+    vx_cl = np.append(vx, vx[0])
+    ax = calc_ax_profile(vx_profile=vx_cl, el_lengths=el, eq_length_output=False)
+    return float(calc_t_profile(vx_profile=vx, ax_profile=ax, el_lengths=el)[-1])
+
+# Worker for user-supplied picklable cost functions
+_generic_worker_fn = None
+
+def _init_generic_worker(fn_bytes):
+    """Initializer: deserialise the user cost function once per worker process."""
+    import pickle
+    global _generic_worker_fn
+    _generic_worker_fn = pickle.loads(fn_bytes)
+
+def _generic_cost_worker(alpha):
+    """Call the user-supplied cost function inside a worker process."""
+    return float(_generic_worker_fn(alpha))
 
 class Opt_min_CurvTime:
     def __init__(self, reftrack, center, mu=0.05, h=0.001, kapb=0.7, sfty=1, t=1, si=0.8,
@@ -1616,12 +1658,12 @@ class Blackbox_raceline:
         reftrack: np.ndarray,
         ggv: np.ndarray,
         ax_max_machines: np.ndarray,
-        sfty: float = 1.0,
+        sfty: float = 0.5,
         v_max: float = 22.88,
-        si: float = 0.8,
+        si: float = 1.0,
         fw: int = 3,
         m_veh: float = 1000.0,
-        drag_coeff: float = 0.0,
+        drag_coeff: float = 0.75,
         dyn_model_exp: float = 1.0,
         cost_fn=None,
         Projection_fn=None,
@@ -1632,8 +1674,9 @@ class Blackbox_raceline:
         t: int = 1,
         grad_type: str = 'noth',
         iterations: int = 300,
-        kappa_bound: float = 0.7,
+        kappa_bound: float = 0.5,
         seed: int = None,
+        n_jobs: int = 1,
     ):
         # ---- store hyper-parameters -------------------------------------------
         self.reftrack      = reftrack.copy()
@@ -1657,7 +1700,7 @@ class Blackbox_raceline:
         self.iterations    = iterations
         self.kappa_bound   = kappa_bound
         self.Projection_fn = Projection_fn
-
+        self.n_jobs        = n_jobs
         if seed is not None:
             np.random.seed(seed)
 
@@ -1841,6 +1884,7 @@ class Blackbox_raceline:
         verbose: bool = True,
         print_every: int = 50,
         feasible_eval: bool = False,
+        n_jobs: int = None,
     ):
         """
         Minimize the cost over alpha using either ZO gradient descent or CMA-ES.
@@ -1885,7 +1929,9 @@ class Blackbox_raceline:
         feasible_eval : bool
             If True, all the points in function evaluations (including perturbations) are projected onto the feasible box before evaluation.
             This can be useful for debugging or if the cost function is only defined within the feasible region.  By default, the ZO solver evaluates the raw (potentially infeasible) perturbations
-
+        n_jobs : int
+            Number of parallel workers for function evaluations.  If >1, evaluations within each iteration/generation are parallelized using a multiprocessing Pool (if the cost_fn is picklable) or a
+            thread pool.
         Returns
         -------
         best_alpha : np.ndarray, shape (N,)
@@ -1898,6 +1944,7 @@ class Blackbox_raceline:
             np.random.seed(seed)
 
         n_iter = n_iter if n_iter is not None else self.iterations
+        n_jobs     = n_jobs     if n_jobs     is not None else self.n_jobs
 
         # ---- evaluate starting point (common to both solvers) ------------------
         alpha_start = self.alpha_0.copy()
@@ -1911,6 +1958,61 @@ class Blackbox_raceline:
             print(f"[Blackbox_raceline/{solver}] init  laptime = {f_start:.4f} s"
                   f"  (init='{self.init}', N={self.N})")
 
+        # ---- parallel evaluation pool (created once, reused for all iters) ----
+        # Three cases depending on n_jobs and cost_fn:
+        #   1. Default laptime (cost_fn=None):        ProcessPoolExecutor, GIL-free.
+        #   2. User cost, picklable (e.g. named fn):  ProcessPoolExecutor via generic worker.
+        #   3. User cost, not picklable (closure/λ):  ThreadPoolExecutor (persistent).
+        import pickle as _pickle
+
+        _pool       = None   # ProcessPoolExecutor or ThreadPoolExecutor
+        _pool_mapfn = None   # the worker callable passed to pool.map (None → self._eval_cost)
+
+        if n_jobs > 1:
+            if self.cost_fn is None:
+                # Default laptime: send track/vehicle data once, workers reconstruct eval
+                _ctx = {
+                    'reftrack'       : self.reftrack,
+                    'normvec'        : self._normvec,
+                    'ggv'            : self.ggv,
+                    'ax_max_machines': self.ax_max_machines,
+                    'v_max'          : self.v_max,
+                    'si'             : self.si,
+                    'fw'             : self.fw,
+                    'm_veh'          : self.m_veh,
+                    'drag_coeff'     : self.drag_coeff,
+                    'dyn_model_exp'  : self.dyn_model_exp,
+                }
+                _pool = ProcessPoolExecutor(
+                    max_workers=n_jobs,
+                    initializer=_init_parallel_worker,
+                    initargs=(_ctx,))
+                _pool_mapfn = _parallel_laptime_worker
+            else:
+                # User-supplied cost function: try to pickle it for ProcessPoolExecutor.
+                # Pickling succeeds for module-level named functions; it fails for
+                # closures / lambdas that capture local variables.
+                try:
+                    _fn_bytes = _pickle.dumps(self.cost_fn)
+                    _pool = ProcessPoolExecutor(
+                        max_workers=n_jobs,
+                        initializer=_init_generic_worker,
+                        initargs=(_fn_bytes,))
+                    _pool_mapfn = _generic_cost_worker
+                except Exception:
+                    # Not picklable: use a persistent thread pool instead.
+                    # Threads share memory so no serialisation is needed; speedup
+                    # depends on how much NumPy (GIL-releasing) the function uses.
+                    _pool = ThreadPoolExecutor(max_workers=n_jobs)
+                    _pool_mapfn = None   # pool.map will call self._eval_cost directly
+
+        def _batch_eval(points):
+            """Evaluate a list of alpha vectors, parallelizing when n_jobs > 1."""
+            if _pool is None or len(points) <= 1:
+                return [self._eval_cost(p) for p in points]
+            fn = _pool_mapfn if _pool_mapfn is not None else self._eval_cost
+            return list(_pool.map(fn, points))
+
         # ====================================================================
         # ZO — projected stochastic gradient descent
         # ====================================================================
@@ -1919,33 +2021,39 @@ class Blackbox_raceline:
             mu        = mu        if mu        is not None else self.mu
             t_dirs    = t         if t         is not None else self.t
             grad_type = grad_type if grad_type is not None else self.grad_type
+            
 
             alpha  = alpha_start.copy()
             f_curr = f_start
 
             for k in range(n_iter):
 
-                # gradient estimate averaged over t_dirs random directions
-                grad_sum = np.zeros(self.N)
-                for _ in range(t_dirs):
-                    u = self._sample_direction()
+                # sample all directions first (single-threaded for reproducibility)
+                directions = [self._sample_direction() for _ in range(t_dirs)]
+
+                # build evaluation points and evaluate in parallel
+                if grad_type == 'noth':
                     if feasible_eval:
-                        alpha_fwd = self._project_alpha(alpha + mu * u)
+                        eval_pts = [self._project_alpha(alpha + mu * u) for u in directions]
                     else:
-                        alpha_fwd = alpha + mu * u
-                    f_fwd     = self._eval_cost(alpha_fwd)
-
-                    if grad_type == 'noth':
-                        g = (f_fwd - f_curr) / mu * u
-                    else:                              # 'h' = central difference
-                        if feasible_eval:
-                            alpha_bwd = self._project_alpha(alpha - mu * u)
-                        else:
-                            alpha_bwd = alpha - mu * u
-                        f_bwd     = self._eval_cost(alpha_bwd)
-                        g = (f_fwd - f_bwd) / (2.0 * mu) * u
-
-                    grad_sum += g
+                        eval_pts = [alpha + mu * u for u in directions]
+                    costs_fwd = _batch_eval(eval_pts)
+                    grad_sum  = np.zeros(self.N)
+                    for c, u in zip(costs_fwd, directions):
+                        grad_sum += (c - f_curr) / mu * u
+                else:  # 'h' = central difference
+                    if feasible_eval:
+                        fwd_pts = [self._project_alpha(alpha + mu * u) for u in directions]
+                        bwd_pts = [self._project_alpha(alpha - mu * u) for u in directions]
+                    else:
+                        fwd_pts = [alpha + mu * u for u in directions]
+                        bwd_pts = [alpha - mu * u for u in directions]
+                    all_costs = _batch_eval(fwd_pts + bwd_pts)
+                    costs_fwd = all_costs[:t_dirs]
+                    costs_bwd = all_costs[t_dirs:]
+                    grad_sum  = np.zeros(self.N)
+                    for ff, fb, u in zip(costs_fwd, costs_bwd, directions):
+                        grad_sum += (ff - fb) / (2.0 * mu) * u
 
                 grad_est = grad_sum / t_dirs
 
@@ -1973,18 +2081,10 @@ class Blackbox_raceline:
             if popsize is None:
                 popsize = 4 + int(3 * np.log(self.N))   # CMA-ES standard heuristic
 
-            # Wrap _eval_cost to track best-ever across all individual evaluations
             _best = {'alpha': best_alpha.copy(), 'cost': best_cost}
 
-            def _tracked_cost(a: np.ndarray) -> float:
-                c = self._eval_cost(a)
-                if c < _best['cost']:
-                    _best['cost']  = c
-                    _best['alpha'] = a.copy()
-                return c
-
             cma = ConstrainedCMAES_t(
-                _tracked_cost,
+                self._eval_cost,
                 mean=alpha_start.copy(),
                 sigma=sigma,
                 popsize=popsize,
@@ -1996,7 +2096,13 @@ class Blackbox_raceline:
 
             for gen in range(n_iter):
                 samples = cma.sample_population()
-                fitness = np.array([cma.objective_function(s) for s in samples])
+                # evaluate population (parallel when n_jobs > 1)
+                fitness = np.array(_batch_eval(list(samples)))
+                # track generation best in main thread (safe for both serial and parallel)
+                min_idx = int(np.argmin(fitness))
+                if fitness[min_idx] < _best['cost']:
+                    _best['cost']  = float(fitness[min_idx])
+                    _best['alpha'] = samples[min_idx].copy()
                 cma.update(samples, fitness)
                 cma.iterations += 1
                 history[gen + 1] = _best['cost']  # best-so-far after this generation
@@ -2012,6 +2118,8 @@ class Blackbox_raceline:
             raise ValueError(f"Unknown solver '{solver}'.  Use 'ZO' or 'CMA'.")
 
         # ---- finalise ----------------------------------------------------------
+        if _pool is not None:
+            _pool.shutdown(wait=False)
         if verbose:
             print(f"[Blackbox_raceline/{solver}] done  best laptime = {best_cost:.4f} s"
                   f"  (improvement = {f_start - best_cost:.4f} s)")
