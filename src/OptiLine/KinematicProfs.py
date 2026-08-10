@@ -488,8 +488,13 @@ def calc_vel_profile_solver(vel_solver: str = 'fb', **kwargs) -> np.ndarray:
                         (FBGA Fb2d). Aliases: 'vanilla'/'forward_backward' -> fb,
                         'fbga'/'FBGA' -> fb2d.
     :type vel_solver:   str
-    :param kwargs:      forwarded to the selected calculator (identical keyword
-                        set as :func:`calc_vel_profile`).
+    :param kwargs:      forwarded to the selected calculator. Besides the shared
+                        keyword set of :func:`calc_vel_profile`, the fb2d-only
+                        keywords ``gg_upper``, ``gg_lower``, ``gg_range``,
+                        ``n_laps`` and ``return_accel`` may be supplied; they are
+                        used by the 'fb2d' branch and silently dropped for 'fb'
+                        (the vanilla solver has no custom-g-g concept). Likewise
+                        ``p_ggv`` is only used by the 'fb' branch.
 
     .. outputs::
     :return vx_profile: calculated velocity profile.
@@ -499,6 +504,9 @@ def calc_vel_profile_solver(vel_solver: str = 'fb', **kwargs) -> np.ndarray:
     key = (vel_solver or 'fb').lower()
 
     if key in ('fb', 'vanilla', 'forward_backward', 'fb1d'):
+        # drop fb2d-only keywords so they never reach the vanilla solver
+        for _k in ('gg_upper', 'gg_lower', 'gg_range', 'n_laps', 'return_accel'):
+            kwargs.pop(_k, None)
         return calc_vel_profile(**kwargs)
 
     if key in ('fb2d', 'fbga'):

@@ -610,7 +610,9 @@ def _parallel_laptime_worker(alpha):
         ggv=ctx['ggv'], ax_max_machines=ctx['ax_max_machines'],
         v_max=ctx['v_max'], kappa=kappa, el_lengths=el, closed=True,
         filt_window=ctx['fw'], dyn_model_exp=ctx['dyn_model_exp'],
-        drag_coeff=ctx['drag_coeff'], m_veh=ctx['m_veh'], p_ggv=p_ggv)
+        drag_coeff=ctx['drag_coeff'], m_veh=ctx['m_veh'], p_ggv=p_ggv,
+        gg_upper=ctx.get('gg_upper'), gg_lower=ctx.get('gg_lower'),
+        gg_range=ctx.get('gg_range'))
     vx_cl = np.append(vx, vx[0])
     ax = calc_ax_profile(vx_profile=vx_cl, el_lengths=el, eq_length_output=False)
     return float(calc_t_profile(vx_profile=vx, ax_profile=ax, el_lengths=el)[-1])
@@ -633,7 +635,8 @@ class Opt_min_CurvTime:
                  vm=22.88, m_veh=3, drag_coeff=0.0045, MC=1, min_s=None, max_s=None, sigma=0.001,
                  iterations_ZO=300, iterations_CMA=30, popsize=16,
                  ggv_import_path="maps/ggv.csv", ax_max_machines_import_path="maps/ax_max_machines.csv",
-                 fw=3, refine_every=None, refine_subsample=1, vel_solver='fb'):
+                 fw=3, refine_every=None, refine_subsample=1, vel_solver='fb',
+                 gg_upper=None, gg_lower=None, gg_range=None):
         """
         Min Curv and Time optimizer.
 
@@ -692,6 +695,9 @@ class Opt_min_CurvTime:
         self.popsize = popsize
         self.fw = fw
         self.vel_solver = vel_solver
+        self.gg_upper = gg_upper
+        self.gg_lower = gg_lower
+        self.gg_range = gg_range
         self.m_veh=m_veh
         self.drag_coeff=drag_coeff
         self.center=center
@@ -919,7 +925,7 @@ class Opt_min_CurvTime:
         n = kappa_opt.size
         if n not in self._p_ggv_cache:
             self._p_ggv_cache[n] = np.repeat(np.expand_dims(self.ggv, axis=0), n, axis=0)
-        vx_profile_opt = calc_vel_profile_solver(vel_solver=self.vel_solver, ggv=self.ggv,
+        vx_profile_opt = calc_vel_profile_solver(vel_solver=self.vel_solver, gg_upper=self.gg_upper, gg_lower=self.gg_lower, gg_range=self.gg_range, ggv=self.ggv,
                                 ax_max_machines=self.ax_max_machines,
                                 v_max=vm,
                                 kappa=kappa_opt,
@@ -1279,7 +1285,7 @@ class Opt_min_CurvTime:
                       t_spls=t_vals_opt_interp)
 
         s_splines = cumulative_distances(el_lengths_opt_interp)
-        vx_profile_opt = calc_vel_profile_solver(vel_solver=self.vel_solver, ggv=self.ggv,
+        vx_profile_opt = calc_vel_profile_solver(vel_solver=self.vel_solver, gg_upper=self.gg_upper, gg_lower=self.gg_lower, gg_range=self.gg_range, ggv=self.ggv,
                          ax_max_machines=self.ax_max_machines,
                          v_max=self.vm,
                          kappa=kappa_opt,
@@ -1385,7 +1391,7 @@ class Opt_min_CurvTime:
                       t_spls=t_vals_opt_interp4)
 
         s_splines4 = cumulative_distances(el_lengths_opt_interp4)
-        vx_profile_opt4 = calc_vel_profile_solver(vel_solver=self.vel_solver, ggv=self.ggv,
+        vx_profile_opt4 = calc_vel_profile_solver(vel_solver=self.vel_solver, gg_upper=self.gg_upper, gg_lower=self.gg_lower, gg_range=self.gg_range, ggv=self.ggv,
                          ax_max_machines=self.ax_max_machines,
                          v_max=self.vm,
                          kappa=kappa_opt4,
@@ -1680,6 +1686,9 @@ class Blackbox_raceline:
         seed: int = None,
         n_jobs: int = 1,
         vel_solver: str = 'fb',
+        gg_upper=None,
+        gg_lower=None,
+        gg_range=None,
     ):
         # ---- store hyper-parameters -------------------------------------------
         self.reftrack      = reftrack.copy()
@@ -1694,6 +1703,9 @@ class Blackbox_raceline:
         self.drag_coeff    = drag_coeff
         self.dyn_model_exp = dyn_model_exp
         self.vel_solver    = vel_solver
+        self.gg_upper      = gg_upper
+        self.gg_lower      = gg_lower
+        self.gg_range      = gg_range
         self.cost_fn       = cost_fn
         self.init          = init
         self.oracle        = oracle
@@ -1849,6 +1861,7 @@ class Blackbox_raceline:
 
         vx = calc_vel_profile_solver(
             vel_solver=self.vel_solver,
+            gg_upper=self.gg_upper, gg_lower=self.gg_lower, gg_range=self.gg_range,
             ggv=self.ggv,
             ax_max_machines=self.ax_max_machines,
             v_max=self.v_max,
@@ -1988,12 +2001,23 @@ class Blackbox_raceline:
                     'drag_coeff'     : self.drag_coeff,
                     'dyn_model_exp'  : self.dyn_model_exp,
                     'vel_solver'     : self.vel_solver,
+                    'gg_upper'       : self.gg_upper,
+                    'gg_lower'       : self.gg_lower,
+                    'gg_range'       : self.gg_range,
                 }
-                _pool = ProcessPoolExecutor(
-                    max_workers=n_jobs,
-                    initializer=_init_parallel_worker,
-                    initargs=(_ctx,))
-                _pool_mapfn = _parallel_laptime_worker
+                # Custom fb2d g-g callables (or GgRangeMaxMin objects) may not be
+                # picklable; in that case fall back to a persistent thread pool
+                # (shared memory, no serialisation) instead of processes.
+                try:
+                    _pickle.dumps(_ctx)
+                    _pool = ProcessPoolExecutor(
+                        max_workers=n_jobs,
+                        initializer=_init_parallel_worker,
+                        initargs=(_ctx,))
+                    _pool_mapfn = _parallel_laptime_worker
+                except Exception:
+                    _pool = ThreadPoolExecutor(max_workers=n_jobs)
+                    _pool_mapfn = None   # pool.map will call self._eval_cost directly
             else:
                 # User-supplied cost function: try to pickle it for ProcessPoolExecutor.
                 # Pickling succeeds for module-level named functions; it fails for
@@ -2182,6 +2206,7 @@ class Blackbox_raceline:
 
         vx = calc_vel_profile_solver(
             vel_solver=self.vel_solver,
+            gg_upper=self.gg_upper, gg_lower=self.gg_lower, gg_range=self.gg_range,
             ggv=self.ggv,
             ax_max_machines=self.ax_max_machines,
             v_max=self.v_max,
@@ -2444,7 +2469,7 @@ def ShortestPath(reftrack: np.ndarray,
         plot: bool,
         v_max = 22.88,
         ggv_import_path="maps/ggv.csv",ax_max_machines_import_path="maps/ax_max_machines.csv",
-        vel_solver='fb') -> np.ndarray:
+        vel_solver='fb', gg_upper=None, gg_lower=None, gg_range=None) -> np.ndarray:
     """
 
     .. description::
@@ -2517,7 +2542,7 @@ def ShortestPath(reftrack: np.ndarray,
     fw = 3
 
     ggv,ax_max_machines =import_veh_dyn_info(ggv_import_path=ggv_import_path,ax_max_machines_import_path=ax_max_machines_import_path)
-    vx_profile_opt = calc_vel_profile_solver(vel_solver=vel_solver, ggv=ggv,
+    vx_profile_opt = calc_vel_profile_solver(vel_solver=vel_solver, gg_upper=gg_upper, gg_lower=gg_lower, gg_range=gg_range, ggv=ggv,
                             ax_max_machines=ax_max_machines,
                             v_max=vm,
                             kappa=kappa_opt,
