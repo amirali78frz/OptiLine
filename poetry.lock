@@ -253,6 +253,42 @@ files = [
 test = ["pytest (>=6)"]
 
 [[package]]
+name = "fbga-py"
+version = "0.1.0"
+description = "Python bindings for the FBGA (Forward-Backward Generic Acceleration constraints) library"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "fbga_py-0.1.0-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:06690bc109849b31cfea9a7b34c55596230e07472b00adddbc4ad627130f14a4"},
+    {file = "fbga_py-0.1.0-cp310-cp310-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:478a90c9e35dccdc4a9321b93b0353542661daf56052c225df497aad1071e18e"},
+    {file = "fbga_py-0.1.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cde45c8c165cef0ca03c54a379c93fef5948c95b3004047210d27603b74cde20"},
+    {file = "fbga_py-0.1.0-cp310-cp310-win32.whl", hash = "sha256:416a785c7b1cdc7ebdfc5a0af02ba3bcc6a213fcaf879d1c3585ea7aca94793a"},
+    {file = "fbga_py-0.1.0-cp310-cp310-win_amd64.whl", hash = "sha256:eea5fa759929429c10aaf6bac124d382337704e615bbf177a968a2fd1e940ecf"},
+    {file = "fbga_py-0.1.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:e21c17316ce36c806908f17e982f8aec244834c7375647dddc2df735e49adf56"},
+    {file = "fbga_py-0.1.0-cp311-cp311-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:c74cf640f7929b01b2a880d3292537ffe489a3aba47d158ac3fa7c2c8b73d4f3"},
+    {file = "fbga_py-0.1.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c651c756124c07c9c60afbe36de83d5f4ba9cdfce7152508a10b15dd22b88da5"},
+    {file = "fbga_py-0.1.0-cp311-cp311-win32.whl", hash = "sha256:ebae6e26efc8044f0b8baa29de341e5be5a2cb4d03265a1621f94e6cbc516dff"},
+    {file = "fbga_py-0.1.0-cp311-cp311-win_amd64.whl", hash = "sha256:c2318e1682c03b4cc2dc6189948ff796dd2010827e66607a9e2b56cbbec875ce"},
+    {file = "fbga_py-0.1.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:991f18f3ba17d55c2fcf3e14dbe2aeb191b933b7576939f4c1d51559cd867a7c"},
+    {file = "fbga_py-0.1.0-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:399226d5cfdff8622431b5687e1e3f3693ff9fe2c36349eef9c10a943061c4aa"},
+    {file = "fbga_py-0.1.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:269330012865405a8ef990a4afb84b561a2e9092e491ed1ba4dd8cf6e3c7bb9f"},
+    {file = "fbga_py-0.1.0-cp312-cp312-win32.whl", hash = "sha256:6eddafea83823cde63a87aee7bb202840101a5ab74f1b3ca3fbde2d7d78ec3a7"},
+    {file = "fbga_py-0.1.0-cp312-cp312-win_amd64.whl", hash = "sha256:0b03974de7a1ee7495e407185ed2d6b1d21ccd9e1b58afeccdc7742a2e1bc0cc"},
+    {file = "fbga_py-0.1.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:201df6e26c1f8f5892bce81903ad438fbf74467935af4d6bbb73d771b507208d"},
+    {file = "fbga_py-0.1.0-cp313-cp313-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:2be55df31010fc00e7864edc32cbc26db8e123ac78e75875af8d0078adc976a3"},
+    {file = "fbga_py-0.1.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d03f810c2a9fe2738648b18836236dd8bac43823b18c07c3e1587363c7178112"},
+    {file = "fbga_py-0.1.0-cp313-cp313-win32.whl", hash = "sha256:12b6cc868655acd70e2df6200ecfa0636779995e2f426557a1e5a9c458fad396"},
+    {file = "fbga_py-0.1.0-cp313-cp313-win_amd64.whl", hash = "sha256:8dc55744fa6f39ab9f1749fec1789f495e70441359318e460b4c2b2d05741fee"},
+    {file = "fbga_py-0.1.0-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:8ab6db0a6fd597849d1b4c3518caa0547c8821789efda79ecce977c1f2cb9328"},
+    {file = "fbga_py-0.1.0-cp39-cp39-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:d8ebbca2f125cbfc4612841fe89c066e7e11a6e2c196877d6efee10ec26b06c2"},
+    {file = "fbga_py-0.1.0-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:97e37311ded7ccf60c63d67bc4c9d3585dcaedbbb9d182bcb40378a3081abcff"},
+    {file = "fbga_py-0.1.0-cp39-cp39-win32.whl", hash = "sha256:9c5769e90d866a13e804170d4300ccd8a00a61623c287366eb0801b2d9c0c1e2"},
+    {file = "fbga_py-0.1.0-cp39-cp39-win_amd64.whl", hash = "sha256:cbbb374fdd7c0744742b2436e91519fbde9bf3bcbd1d2d399de4fd475f1e94d0"},
+    {file = "fbga_py-0.1.0.tar.gz", hash = "sha256:b94b07fda3ddb0266c936c4c4a42e4a40d47907ab1be72fa2250536c52bea503"},
+]
+
+[[package]]
 name = "fonttools"
 version = "4.57.0"
 description = "Tools to manipulate font files"
@@ -942,4 +978,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "741c291e9e4451ac0918c98b17489a755bdee52e87c56da0333d66f34287c166"
+content-hash = "223576ec0125b041a12c1f4690fa353f268246b929253040ccc41a9acdd56735"
