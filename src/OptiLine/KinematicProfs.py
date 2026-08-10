@@ -251,6 +251,263 @@ def calc_vel_profile(ax_max_machines: np.ndarray,
     return vx_profile
 
 
+def calc_vel_profile_fb2d(ax_max_machines: np.ndarray,
+                          kappa: np.ndarray,
+                          el_lengths: np.ndarray,
+                          closed: bool,
+                          drag_coeff: float,
+                          m_veh: float,
+                          ggv: np.ndarray = None,
+                          loc_gg: np.ndarray = None,
+                          v_max: float = None,
+                          dyn_model_exp: float = 1.0,
+                          mu: np.ndarray = None,
+                          v_start: float = None,
+                          v_end: float = None,
+                          filt_window: int = None,
+                          p_ggv: np.ndarray = None,
+                          gg_upper=None,
+                          gg_lower=None,
+                          gg_range=None,
+                          n_laps: int = 3,
+                          return_accel: bool = False):
+    """
+
+    .. description::
+    Alternative velocity-profile calculator based on the FBGA ``Fb2d`` solver
+    (github.com/DRIVEWISE/FBGA, pip package ``fbga-py``). It is a drop-in
+    alternative to :func:`calc_vel_profile`: it solves the same minimum-time,
+    fixed-path velocity-profile problem, but integrates the longitudinal
+    dynamics semi-analytically (see Frego et al., "Semi-Analytical Minimum Time
+    Solutions with Velocity Constraints for Trajectory Following of Vehicles").
+
+    The g-g bounds handed to ``Fb2d`` are built so that they reproduce exactly
+    the acceleration model used inside :func:`calc_ax_poss`, i.e.::
+
+        ax_max_tire(v) = mu * interp(v, ggv[:,0], ggv[:,1])
+        ay_max_tire(v) = mu * interp(v, ggv[:,0], ggv[:,2])
+        ax_avail(ay,v) = ax_max_tire * (1 - (|ay|/ay_max_tire)^exp)^(1/exp)
+        drive : min(ax_avail, ax_machine(v)) - drag_coeff*v^2/m_veh
+        brake : -ax_avail                    - drag_coeff*v^2/m_veh
+        + hard top-speed cap at v_max
+
+    so that, for the same inputs, both calculators refer to the same vehicle.
+
+    .. inputs::
+    Signature mirrors :func:`calc_vel_profile` (see there for the shared
+    parameters). Additional / changed parameters:
+
+    :param gg_upper:        optional custom drive bound ``ax = f(ay, v)`` handed
+                            directly to ``Fb2d`` (the "generic acceleration"
+                            feature). If None it is built from ``ggv`` as above.
+    :param gg_lower:        optional custom brake bound ``ax = f(ay, v)``. If
+                            None it is built from ``ggv`` as above.
+    :param gg_range:        optional lateral bound. Either an ``fbga_py``
+                            ``GgRangeMaxMin`` object, or a callable
+                            ``ay_max = f(v)`` (a symmetric range +/-f(v) is
+                            built from it). If None it is built from ``ggv``.
+    :param n_laps:          number of laps the (closed) track is tiled over to
+                            obtain a periodic profile (the middle lap is kept,
+                            same trick as the closed forward-backward solver).
+                            Must be odd so that a well-defined middle lap exists.
+    :type n_laps:           int
+    :param return_accel:    if True, also return the longitudinal acceleration
+                            profile provided by the solver (same length as the
+                            returned velocity profile).
+    :type return_accel:     bool
+
+    .. outputs::
+    :return vx_profile:     calculated velocity profile (always unclosed, same
+                            shape convention as :func:`calc_vel_profile`).
+    :return ax_profile:     (only if return_accel is True) longitudinal
+                            acceleration profile from the solver.
+
+    .. notes::
+    * Requires the optional dependency ``fbga-py`` (imported lazily so that the
+      rest of the package works without it).
+    * Only the ``ggv`` operating mode is supported. Position dependent inputs
+      (``loc_gg`` or a spatially varying ``mu`` array) are not representable by
+      the single velocity/lateral dependent g-g functions ``Fb2d`` expects; a
+      ``mu`` array is collapsed to its mean and ``loc_gg`` is rejected.
+    """
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # INPUT CHECKS -----------------------------------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------------------------------
+
+    try:
+        import fbga_py as _fb
+    except ImportError as exc:                                    # pragma: no cover
+        raise ImportError(
+            "calc_vel_profile_fb2d requires the optional dependency 'fbga-py' "
+            "(pip install fbga-py). Install it or use vel_solver='fb'."
+        ) from exc
+
+    if loc_gg is not None and ggv is None:
+        raise RuntimeError("calc_vel_profile_fb2d supports the ggv mode only (loc_gg is not supported)!")
+
+    # which pieces still have to be derived from ggv (i.e. were not supplied explicitly)
+    need_ggv = (gg_upper is None) or (gg_lower is None) or (gg_range is None)
+
+    if need_ggv:
+        if ggv is None:
+            raise RuntimeError("ggv must be supplied unless gg_upper, gg_lower and gg_range are all provided!")
+        if ggv.ndim != 2 or ggv.shape[1] != 3:
+            raise RuntimeError("ggv diagram must consist of the three columns [vx, ax_max, ay_max]!")
+        if ax_max_machines.shape[1] != 2:
+            raise RuntimeError("ax_max_machines must consist of the two columns [vx, ax_max_machines]!")
+
+    if closed and kappa.size != el_lengths.size:
+        raise RuntimeError("kappa and el_lengths must have the same length if closed!")
+
+    if not closed and kappa.size != el_lengths.size + 1:
+        raise RuntimeError("kappa must have the length of el_lengths + 1 if unclosed!")
+
+    if not closed and v_start is None:
+        raise RuntimeError("v_start must be provided for the unclosed case!")
+
+    if closed and n_laps % 2 == 0:
+        raise RuntimeError("n_laps must be odd so that a well-defined middle lap exists!")
+
+    if v_max is None:
+        if ggv is None:
+            raise RuntimeError("v_max must be supplied when ggv is not given!")
+        v_max = float(min(ggv[-1, 0], ax_max_machines[-1, 0]))
+
+    # collapse friction to a scalar (Fb2d g-g functions cannot depend on position)
+    if mu is None:
+        mu_s = 1.0
+    else:
+        mu_s = float(np.mean(mu))
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # BUILD THE G-G BOUNDS (identical accel model to calc_ax_poss) ------------------------------------------------------
+    # ------------------------------------------------------------------------------------------------------------------
+
+    # default g-g bounds derived from ggv (used for whichever of upper/lower/range was not supplied)
+    def _ay_max_tire(v):
+        return mu_s * np.interp(v, ggv[:, 0], ggv[:, 2])
+
+    if need_ggv:
+        exp = dyn_model_exp
+
+        def _ax_max_tire(v):
+            return mu_s * np.interp(v, ggv[:, 0], ggv[:, 1])
+
+        def _ax_machine(v):
+            return np.interp(v, ax_max_machines[:, 0], ax_max_machines[:, 1])
+
+        def _ax_avail_tire(ay, v):
+            ay_max = _ay_max_tire(v)
+            if ay_max <= 0.0:
+                return 0.0
+            radicand = 1.0 - (min(abs(ay) / ay_max, 1.0)) ** exp
+            return _ax_max_tire(v) * radicand ** (1.0 / exp) if radicand > 0.0 else 0.0
+
+        def _default_gg_upper(ay, v):                            # max longitudinal accel (drive)
+            ax = min(_ax_avail_tire(ay, v), _ax_machine(v)) - v * v * drag_coeff / m_veh
+            return min(ax, 0.0) if v >= v_max else ax            # hard top-speed cap
+
+        def _default_gg_lower(ay, v):                            # min longitudinal accel (brake)
+            return -_ax_avail_tire(ay, v) - v * v * drag_coeff / m_veh
+
+    # longitudinal bounds: use the user-supplied callables where given, otherwise the ggv defaults
+    upper_fn = gg_upper if gg_upper is not None else _default_gg_upper
+    lower_fn = gg_lower if gg_lower is not None else _default_gg_lower
+
+    # lateral range: object -> use directly; callable -> symmetric +/-f(v); None -> build from ggv
+    if gg_range is None:
+        range_obj = _fb.GgRangeMaxMin()
+        range_obj.max = lambda v: _ay_max_tire(v)
+        range_obj.min = lambda v: -_ay_max_tire(v)
+    elif callable(gg_range):
+        range_obj = _fb.GgRangeMaxMin()
+        range_obj.max = lambda v: gg_range(v)
+        range_obj.min = lambda v: -gg_range(v)
+    else:
+        range_obj = gg_range                                     # assumed to be a GgRangeMaxMin-like object
+
+    solver = _fb.Fb2d(upper_fn, lower_fn, range_obj)
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # SOLVE ------------------------------------------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------------------------------
+
+    if closed:
+        # el_lengths is closed (len == kappa). Tile over n_laps and keep the middle lap so that the resulting
+        # profile is periodic (vx[0] matches vx[-1]) -- same rationale as the closed forward-backward solver.
+        no_points = kappa.size
+        lap_length = float(np.sum(el_lengths))
+        s_lap = np.concatenate(([0.0], np.cumsum(el_lengths)[:-1]))     # arc length of each point, 0 .. L-el[-1]
+        SS = np.concatenate([s_lap + i * lap_length for i in range(n_laps)])
+        KK = np.tile(kappa, n_laps)
+        v0 = v_max                                                # forward-backward settles the middle lap
+        solver.compute(SS.tolist(), KK.tolist(), float(v0), float(v_max))
+        AX, _, VX = solver.evaluate(SS.tolist())
+        mid = n_laps // 2
+        sel = slice(mid * no_points, (mid + 1) * no_points)
+        vx_profile = np.asarray(VX, dtype=float)[sel]
+        ax_profile = np.asarray(AX, dtype=float)[sel]
+    else:
+        # unclosed: kappa has len(el_lengths) + 1 points.
+        SS = np.concatenate(([0.0], np.cumsum(el_lengths)))
+        KK = np.asarray(kappa, dtype=float)
+        v0 = v_start
+        solver.compute(SS.tolist(), KK.tolist(), float(v0), float(v_max))
+        AX, _, VX = solver.evaluate(SS.tolist())
+        vx_profile = np.asarray(VX, dtype=float)
+        ax_profile = np.asarray(AX, dtype=float)
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # POSTPROCESSING ---------------------------------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------------------------------
+
+    if filt_window is not None:
+        vx_profile = conv_filt(signal=vx_profile,
+                               filt_window=filt_window,
+                               closed=closed)
+
+    if return_accel:
+        return vx_profile, ax_profile
+
+    return vx_profile
+
+
+def calc_vel_profile_solver(vel_solver: str = 'fb', **kwargs) -> np.ndarray:
+    """
+
+    .. description::
+    Thin dispatcher that returns a velocity profile from either the vanilla
+    forward-backward solver (:func:`calc_vel_profile`) or the FBGA-based
+    alternative (:func:`calc_vel_profile_fb2d`), so that call sites can offer
+    the choice with a single keyword. Both branches return the velocity profile
+    with the same shape convention.
+
+    .. inputs::
+    :param vel_solver:  'fb' (default, vanilla forward-backward) or 'fb2d'
+                        (FBGA Fb2d). Aliases: 'vanilla'/'forward_backward' -> fb,
+                        'fbga'/'FBGA' -> fb2d.
+    :type vel_solver:   str
+    :param kwargs:      forwarded to the selected calculator (identical keyword
+                        set as :func:`calc_vel_profile`).
+
+    .. outputs::
+    :return vx_profile: calculated velocity profile.
+    :rtype vx_profile:  np.ndarray
+    """
+
+    key = (vel_solver or 'fb').lower()
+
+    if key in ('fb', 'vanilla', 'forward_backward', 'fb1d'):
+        return calc_vel_profile(**kwargs)
+
+    if key in ('fb2d', 'fbga'):
+        kwargs.pop('p_ggv', None)                # performance cache only used by the vanilla solver
+        return calc_vel_profile_fb2d(**kwargs)
+
+    raise ValueError(f"Unknown vel_solver '{vel_solver}'. Use 'fb' or 'fb2d'.")
+
+
 def __solver_fb_unclosed(p_ggv: np.ndarray,
                          ax_max_machines: np.ndarray,
                          v_max: float,
