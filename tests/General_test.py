@@ -79,7 +79,7 @@ print_stage(1, "Track import and preprocessing")
 # - A centerline CSV with columns [x, y, w_right, w_left]
 # - A GGV table CSV for vehicle dynamics
 # - An ax_max_machines CSV for maximum acceleration limits
-MAP_PATH = "maps/Catalunya/Catalunya_centerline.csv"
+MAP_PATH = "maps/Budapest/Budapest_centerline.csv"
 GGV_PATH = "maps/ggv.csv"
 AX_MAX_PATH = "maps/ax_max_machines.csv"
 
@@ -1095,6 +1095,109 @@ print(f"\nStage 9 total time : {t_stage9_total:.1f} s  (serial + parallel, both 
 
 
 # ===========================================================================
+# Stage 10 – FBGA fb2d velocity profile (alternative vel_solver)
+#            Demonstrates the new option to compute the velocity profile with
+#            the FBGA Fb2d solver instead of the vanilla forward-backward one,
+#            using the SAME parameters. Lap times use calc_t_profile for both,
+#            so the comparison is consistent.
+# ===========================================================================
+print_stage(10, "FBGA fb2d velocity profile - alternative solver (vel_solver)")
+
+try:
+    import fbga_py  # noqa: F401
+    _HAS_FBGA = True
+except ImportError:
+    _HAS_FBGA = False
+
+if not _HAS_FBGA:
+    print("SKIP: optional dependency 'fbga-py' is not installed (pip install fbga-py).")
+    t_fb2d_mc = None
+else:
+    from OptiLine.KinematicProfs import calc_vel_profile_fb2d, calc_vel_profile_solver
+
+    def _laptime_closed(vx, el):
+        """Lap time via the package's calc_t_profile (consistent for both solvers)."""
+        vx_cl = np.append(vx, vx[0])
+        ax = calc_ax_profile(vx_profile=vx_cl, el_lengths=el, eq_length_output=False)
+        return float(calc_t_profile(vx_profile=vx, ax_profile=ax, el_lengths=el)[-1])
+
+    # Reuse the min-curvature curvature / element lengths from Stage 3 so that both
+    # solvers see exactly the same raceline and the same vehicle parameters.
+    common_vp = dict(ggv=ggv, ax_max_machines=ax_max_machines, v_max=22.88,
+                     kappa=kappa_mc, el_lengths=el_mc, closed=True, filt_window=3,
+                     dyn_model_exp=1.0, drag_coeff=0.75, m_veh=1000.0)
+
+    # (a) both solvers through the dispatcher -----------------------------------
+    vx_fb   = calc_vel_profile_solver(vel_solver='fb',   **common_vp)
+    vx_fb2d = calc_vel_profile_solver(vel_solver='fb2d', **common_vp)
+    t_fb_mc   = _laptime_closed(vx_fb,   el_mc)
+    t_fb2d_mc = _laptime_closed(vx_fb2d, el_mc)
+    print(f"vanilla fb : v[min/max]=[{vx_fb.min():.2f}, {vx_fb.max():.2f}] m/s  "
+          f"laptime={t_fb_mc:.3f} s")
+    print(f"FBGA fb2d  : v[min/max]=[{vx_fb2d.min():.2f}, {vx_fb2d.max():.2f}] m/s  "
+          f"laptime={t_fb2d_mc:.3f} s")
+    print(f"lap-time difference (fb2d - fb) : {t_fb2d_mc - t_fb_mc:+.3f} s")
+
+    # (b) fb2d also returns the longitudinal acceleration profile ----------------
+    vx_ra, ax_ra = calc_vel_profile_fb2d(return_accel=True, **common_vp)
+    assert np.allclose(vx_ra, vx_fb2d), "return_accel velocity mismatch!"
+    assert vx_fb2d.size == kappa_mc.size, "fb2d closed profile length mismatch!"
+    print(f"fb2d also returns accel : ax range=[{ax_ra.min():.2f}, {ax_ra.max():.2f}] m/s^2  "
+          f"(closed profile length matches kappa: {vx_fb2d.size == kappa_mc.size})")
+
+    # (c) generic g-g: custom drive/brake bounds reproducing the ggv defaults -----
+    #     (this ggv is constant in v, so a diamond envelope with dyn_model_exp=1
+    #      plus the machine limit, drag and the v_max cap reproduces it exactly)
+    ax_max0 = float(ggv[0, 1])            # constant longitudinal tyre limit
+    ay_max0 = float(ggv[0, 2])            # constant lateral tyre limit
+    mach0   = float(ax_max_machines[0, 1])
+    _drag, _m, _vmax = 0.75, 1000.0, 22.88
+
+    def _avail(ay, v):
+        return ax_max0 * (1.0 - min(abs(ay) / ay_max0, 1.0))   # dyn_model_exp = 1
+
+    def _up(ay, v):
+        ax = min(_avail(ay, v), mach0) - v * v * _drag / _m
+        return min(ax, 0.0) if v >= _vmax else ax
+
+    def _lo(ay, v):
+        return -_avail(ay, v) - v * v * _drag / _m
+
+    vx_custom = calc_vel_profile_fb2d(gg_upper=_up, gg_lower=_lo,
+                                      gg_range=lambda v: ay_max0, **common_vp)
+    ok_custom = np.allclose(vx_custom, vx_fb2d)
+    assert ok_custom, "custom gg_upper/gg_lower should reproduce the ggv defaults!"
+    print(f"custom gg_upper/gg_lower reproduce the ggv defaults : {ok_custom}")
+
+    # (d) dispatcher default is the vanilla solver, 'fbga' is an alias for fb2d ---
+    assert np.allclose(calc_vel_profile_solver(**common_vp), vx_fb), "default != fb!"
+    assert np.allclose(calc_vel_profile_solver(vel_solver='fbga', **common_vp), vx_fb2d), "alias!"
+    print("dispatcher default == fb, and 'fbga' alias == fb2d : OK")
+
+    # (e) end-to-end: the vel_solver option is honoured by a solver function -------
+    sp_fb = solvers.ShortestPath(
+        reftrack=reftrack, w_veh=1.0, stepsize=2, plot=False, v_max=22.88,
+        ggv_import_path=GGV_PATH, ax_max_machines_import_path=AX_MAX_PATH,
+        vel_solver='fb')[-1][-1]
+    sp_fb2d = solvers.ShortestPath(
+        reftrack=reftrack, w_veh=1.0, stepsize=2, plot=False, v_max=22.88,
+        ggv_import_path=GGV_PATH, ax_max_machines_import_path=AX_MAX_PATH,
+        vel_solver='fb2d')[-1][-1]
+    print(f"ShortestPath end-to-end : laptime fb={sp_fb:.3f} s   fb2d={sp_fb2d:.3f} s")
+
+    # overlay plot
+    plt.figure(figsize=(9, 4))
+    plt.title("Stage 10 - velocity profile: vanilla fb vs FBGA fb2d (min-curvature raceline)")
+    plt.plot(s_splines_mc, vx_fb, label=f"vanilla fb  ({t_fb_mc:.2f} s)")
+    plt.plot(s_splines_mc, vx_fb2d, '--', label=f"FBGA fb2d  ({t_fb2d_mc:.2f} s)")
+    plt.xlabel("s [m]"); plt.ylabel("v [m/s]"); plt.grid(True); plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    print("Stage 10 completed - fb2d integration verified.")
+
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 print("\n" + "=" * 60)
@@ -1113,5 +1216,7 @@ zo_par_speedup  = par_timing[('ZO', 1)]  / par_timing[('ZO', N_JOBS_PAR)]
 cma_par_speedup = par_timing[('CMA', 1)] / par_timing[('CMA', N_JOBS_PAR)]
 print(f"  BB / ZO  parallel speedup ({N_JOBS_PAR} cores)       : {zo_par_speedup:.2f}x")
 print(f"  BB / CMA parallel speedup ({N_JOBS_PAR} cores)       : {cma_par_speedup:.2f}x")
+if t_fb2d_mc is not None:
+    print(f"  Stage 10 FBGA fb2d laptime (min-curv)      : {t_fb2d_mc:.2f} s")
 print("=" * 60)
 print("All stages completed successfully.")
