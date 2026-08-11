@@ -636,7 +636,7 @@ class Opt_min_CurvTime:
                  iterations_ZO=300, iterations_CMA=30, popsize=16,
                  ggv_import_path="maps/ggv.csv", ax_max_machines_import_path="maps/ax_max_machines.csv",
                  fw=3, refine_every=None, refine_subsample=1, vel_solver='fb',
-                 gg_upper=None, gg_lower=None, gg_range=None):
+                 gg_upper=None, gg_lower=None, gg_range=None, dyn_model_exp=1.0):
         """
         Min Curv and Time optimizer.
 
@@ -698,6 +698,7 @@ class Opt_min_CurvTime:
         self.gg_upper = gg_upper
         self.gg_lower = gg_lower
         self.gg_range = gg_range
+        self.dyn_model_exp = dyn_model_exp
         self.m_veh=m_veh
         self.drag_coeff=drag_coeff
         self.center=center
@@ -932,7 +933,7 @@ class Opt_min_CurvTime:
                                 el_lengths=el_lengths_opt_interp,
                                 closed=True,
                                 filt_window=fw,
-                                dyn_model_exp=1.0,
+                                dyn_model_exp=self.dyn_model_exp,
                                 drag_coeff=self.drag_coeff,
                                 m_veh=self.m_veh,
                                 v_start = 0.0,
@@ -1292,7 +1293,7 @@ class Opt_min_CurvTime:
                          el_lengths=el_lengths_opt_interp,
                          closed=True,
                          filt_window=self.fw,
-                         dyn_model_exp=1.0,
+                         dyn_model_exp=self.dyn_model_exp,
                          drag_coeff=self.drag_coeff,
                          m_veh=self.m_veh,
                          v_start = 0.0)
@@ -1398,7 +1399,7 @@ class Opt_min_CurvTime:
                          el_lengths=el_lengths_opt_interp4,
                          closed=True,
                          filt_window=self.fw,
-                         dyn_model_exp=1.0,
+                         dyn_model_exp=self.dyn_model_exp,
                          drag_coeff=self.drag_coeff,
                          m_veh=self.m_veh,
                          v_start = 0.0)
@@ -2469,7 +2470,8 @@ def ShortestPath(reftrack: np.ndarray,
         plot: bool,
         v_max = 22.88,
         ggv_import_path="maps/ggv.csv",ax_max_machines_import_path="maps/ax_max_machines.csv",
-        vel_solver='fb', gg_upper=None, gg_lower=None, gg_range=None) -> np.ndarray:
+        vel_solver='fb', gg_upper=None, gg_lower=None, gg_range=None,
+        dyn_model_exp=1.0) -> np.ndarray:
     """
 
     .. description::
@@ -2549,7 +2551,7 @@ def ShortestPath(reftrack: np.ndarray,
                             el_lengths=el_lengths_opt_interp,
                             closed=True,
                             filt_window=fw,
-                            dyn_model_exp=1.0,
+                            dyn_model_exp=dyn_model_exp,
                             drag_coeff=0.75,
                             m_veh=1000.0,
                             v_start = 0.0)
