@@ -294,8 +294,6 @@ optct = solvers.Opt_min_CurvTime(
     m_veh=1000,              # vehicle mass [kg]
     drag_coeff=0.75,         # aerodynamic drag coefficient
     MC=1,                    # Monte Carlo repetitions
-    # min_s=0.5,               # minimum spline segment length [m]
-    # max_s=2.0,               # maximum spline segment length [m]
     sigma=0.005,             # initial CMA-ES covariance
     iterations_ZO=30,       # ZO optimizer iterations (increase for better results)
     iterations_CMA=5,       # CMA-ES optimizer iterations
@@ -1195,6 +1193,81 @@ else:
     plt.show()
 
     print("Stage 10 completed - fb2d integration verified.")
+
+
+# ===========================================================================
+# Stage 11 - Per-segment spline-length bounds (s_scale)
+#            Opt_min_CurvTime constrains each spline interval s_i to a box.
+#            SINCE v0.1.9.7 the default is PER-SEGMENT: [0.66*s_i, 1.5*s_i], built
+#            from each interval's own initial length (solvers.DEFAULT_S_SCALE).
+#            The previous default was a single GLOBAL box
+#            [min_i s_i, 1.7*max_i s_i] shared by every segment. That is badly
+#            conditioned when the reference points are unevenly spaced: one short
+#            segment drags the lower bound down for all of them, so the outer
+#            solver can propose spline parameterisations that lie inside the
+#            declared feasible set yet are geometrically degenerate, at which
+#            point the inner minimum-curvature QP may fail.
+# ===========================================================================
+print_stage(11, "Per-segment spline-length bounds (s_scale)")
+
+from OptiLine.solvers import DEFAULT_S_SCALE
+
+_lens = np.hypot(*np.diff(reftrack[:, :2], axis=0).T)
+_lens = np.append(_lens, np.hypot(*(reftrack[0, :2] - reftrack[-1, :2])))
+print(f"Segment lengths: min={_lens.min():.3f}  median={np.median(_lens):.3f}  "
+      f"max={_lens.max():.3f} m   (max/min = {_lens.max()/_lens.min():.1f})")
+
+def _build_ct(**kw):
+    return solvers.Opt_min_CurvTime(
+        reftrack=reftrack, center=reftrack, mu=0.01, h=0.001, kapb=0.5, sfty=0.5,
+        si=2, vm=22.88, m_veh=1000, drag_coeff=0.75, MC=1, sigma=0.005,
+        iterations_ZO=5, iterations_CMA=2, popsize=6,
+        ggv_import_path=GGV_PATH, ax_max_machines_import_path=AX_MAX_PATH,
+        fw=3, **kw)
+
+opt_default = _build_ct()                                       # per-segment (new default)
+opt_global  = _build_ct(min_s=float(_lens.min()),               # old global box
+                        max_s=float(_lens.max()) * 1.7)
+
+print(f"  default  (s_scale={DEFAULT_S_SCALE}): min_s in "
+      f"[{np.min(opt_default.min_s):.3f}, {np.max(opt_default.min_s):.3f}], "
+      f"max_s in [{np.min(opt_default.max_s):.3f}, {np.max(opt_default.max_s):.3f}]")
+print(f"  legacy global box              : min_s = {opt_global.min_s:.3f}, "
+      f"max_s = {opt_global.max_s:.3f} (shared by every segment)")
+assert np.ndim(opt_default.min_s) == 1 and len(opt_default.min_s) == len(_lens)
+assert opt_default.s_scale == DEFAULT_S_SCALE
+
+# how many points drawn from inside the declared feasible set are actually usable?
+_rng = np.random.default_rng(0)
+for _name, _o in (("legacy global box", opt_global), ("default per-segment", opt_default)):
+    _lo = np.asarray(_o.min_s) * np.ones(len(_lens))
+    _hi = np.asarray(_o.max_s) * np.ones(len(_lens))
+    _bad = 0
+    for _ in range(15):
+        try:
+            _v = float(_o.f_t(_rng.uniform(_lo, _hi)))
+            if not np.isfinite(_v):
+                _bad += 1
+        except Exception:
+            _bad += 1
+    print(f"  {_name:<21}: {_bad:2d}/15 feasible-box samples failed the inner QP")
+
+# min_s / max_s may also be supplied directly as arrays
+opt_arr = _build_ct(min_s=0.7 * _lens, max_s=1.5 * _lens)
+assert len(np.asarray(opt_arr.min_s)) == len(_lens)
+print("  arrays accepted directly for min_s / max_s: OK")
+
+# input validation
+for _kw, _label in ((dict(min_s=0.5), "only min_s given"),
+                    (dict(max_s=2.0), "only max_s given"),
+                    (dict(s_scale=(0.6, 1.6), min_s=0.5, max_s=2.0), "s_scale + min_s/max_s"),
+                    (dict(s_scale=(1.5, 0.6)), "s_scale with lo > hi")):
+    try:
+        _build_ct(**_kw)
+        raise AssertionError(f"expected RuntimeError for: {_label}")
+    except RuntimeError:
+        print(f"  rejects {_label:<24}: OK")
+print("Stage 11 completed.")
 
 
 # ===========================================================================
