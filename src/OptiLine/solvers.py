@@ -630,13 +630,20 @@ def _generic_cost_worker(alpha):
     """Call the user-supplied cost function inside a worker process."""
     return float(_generic_worker_fn(alpha))
 
+#: Default per-segment spline-length scaling used by :class:`Opt_min_CurvTime`
+#: when neither ``s_scale`` nor ``min_s``/``max_s`` is supplied: each interval is
+#: constrained to ``[0.66 * s_i, 1.5 * s_i]`` of its own initial length.
+DEFAULT_S_SCALE = (0.66, 1.5)
+
+
 class Opt_min_CurvTime:
     def __init__(self, reftrack, center, mu=0.05, h=0.001, kapb=0.7, sfty=1, t=1, si=0.8,
                  vm=22.88, m_veh=3, drag_coeff=0.0045, MC=1, min_s=None, max_s=None, sigma=0.001,
                  iterations_ZO=300, iterations_CMA=30, popsize=16,
                  ggv_import_path="maps/ggv.csv", ax_max_machines_import_path="maps/ax_max_machines.csv",
                  fw=3, refine_every=None, refine_subsample=1, vel_solver='fb',
-                 gg_upper=None, gg_lower=None, gg_range=None, dyn_model_exp=1.0):
+                 gg_upper=None, gg_lower=None, gg_range=None, dyn_model_exp=1.0,
+                 s_scale=None):
         """
         Min Curv and Time optimizer.
 
@@ -652,8 +659,19 @@ class Opt_min_CurvTime:
         - si: interpolation step size of the race line
         - vm: maximum available velocity
         - MC: Monte Carlo number of repetion for ZO solvers
-        - min_s: minimum curv length
-        - max_s: maximum curv length
+        - min_s: minimum spline-segment length. Either a scalar (one interval shared by
+                 every segment) or an array with one entry per segment.
+        - max_s: maximum spline-segment length, same convention as min_s.
+        - s_scale: tuple (lo, hi) giving per-segment bounds [lo * s_i, hi * s_i] built
+                 from each segment's own initial length. This is the DEFAULT since
+                 v0.1.9.7, with (lo, hi) = DEFAULT_S_SCALE = (0.66, 1.5). It replaces the
+                 previous default of a single global box shared by every segment, which
+                 is badly conditioned on unevenly spaced tracks: one short segment drags
+                 the lower bound down for all of them, so the outer solver can propose
+                 parameterisations that are nominally feasible but geometrically
+                 degenerate, making the inner QP infeasible.
+                 Pass min_s/max_s explicitly to recover the old global-box behaviour;
+                 s_scale and min_s/max_s are mutually exclusive.
         - sigma: Initial covariance for CMA-es solver
         - popsize: population size for CMA-es solver
         - iterations_CMA: number of iterations for ZORM solver
@@ -671,10 +689,45 @@ class Opt_min_CurvTime:
                         becomes the refined reference track.  1 = no sub-sampling (default).
         """
 
-        if min_s is None and max_s is None:
-            el_lengths = np.sqrt(np.sum(np.power(np.diff(np.vstack((reftrack[:, 0:2], reftrack[0, 0:2])), axis=0), 2), axis=1))
-            min_s = np.min(el_lengths) *1
-            max_s = np.max(el_lengths) *1.7
+        el_lengths = np.sqrt(np.sum(np.power(np.diff(np.vstack((reftrack[:, 0:2], reftrack[0, 0:2])), axis=0), 2), axis=1))
+
+        # Supplying only one side of the box is ambiguous: the missing side used to be
+        # left as None and silently reached np.clip, which treats it as "no bound".
+        if (min_s is None) != (max_s is None):
+            raise RuntimeError("min_s and max_s must be given together (or both left "
+                               "as None to use s_scale). Supplying only one of them "
+                               "would leave the other side unbounded!")
+        if s_scale is not None and min_s is not None:
+            raise RuntimeError("Give either s_scale (per-segment bounds) or "
+                               "min_s/max_s (explicit bounds), not both!")
+
+        if s_scale is None and min_s is None:
+            # DEFAULT since v0.1.9.7: per-segment bounds. The previous default was a
+            # single global box [min_i s_i, 1.7 max_i s_i] shared by every segment,
+            # which is badly conditioned on unevenly spaced tracks (see s_scale below).
+            s_scale = DEFAULT_S_SCALE
+
+        if s_scale is not None:
+            # PER-SEGMENT bounds: each interval is constrained relative to its OWN
+            # initial length, [lo * s_i, hi * s_i]. This avoids the pathology of the
+            # global box, where a single short segment lowers the bound for every
+            # other segment (and the longest segment raises it), allowing highly
+            # non-uniform spline parameterisations that can make the inner
+            # minimum-curvature QP infeasible.
+            _lo, _hi = float(s_scale[0]), float(s_scale[1])
+            if not 0.0 < _lo <= _hi:
+                raise RuntimeError("s_scale must be (lo, hi) with 0 < lo <= hi!")
+            min_s = _lo * el_lengths
+            max_s = _hi * el_lengths
+
+        # min_s / max_s may be scalars (global box) or arrays of one entry per
+        # segment (per-segment box); validate the array case.
+        for _nm, _v in (("min_s", min_s), ("max_s", max_s)):
+            if np.ndim(_v) > 0 and np.size(_v) != el_lengths.size:
+                raise RuntimeError(f"{_nm} must be a scalar or have {el_lengths.size} "
+                                   f"entries (one per segment), got {np.size(_v)}!")
+        if np.any(np.asarray(max_s) <= np.asarray(min_s)):
+            raise RuntimeError("max_s must be strictly greater than min_s for every segment!")
 
         self.reftrack = reftrack
         self.mu = mu
@@ -689,6 +742,7 @@ class Opt_min_CurvTime:
         self.MC = MC
         self.min_s=min_s
         self.max_s=max_s
+        self.s_scale=s_scale          # resolved value (may be the default)
         self.iterations_ZO=iterations_ZO
         self.iterations_CMA=iterations_CMA
         self.sigma = sigma
@@ -753,8 +807,13 @@ class Opt_min_CurvTime:
         self.reftrack = reftrack_new
         lengths = np.sqrt(np.sum(np.power(np.diff(np.vstack((reftrack_new[:,0:2], reftrack_new[0,0:2])), axis=0), 2), axis=1))
         self.lengths = lengths
-        self.min_s = float(np.min(lengths))
-        self.max_s = float(np.max(lengths)) * 1.7
+        if getattr(self, 's_scale', None) is not None:
+            # keep the per-segment box tied to the NEW segment lengths
+            self.min_s = float(self.s_scale[0]) * lengths
+            self.max_s = float(self.s_scale[1]) * lengths
+        else:
+            self.min_s = float(np.min(lengths))
+            self.max_s = float(np.max(lengths)) * 1.7
         self._p_ggv_cache = {}   # kappa size may have changed — invalidate
 
     def _build_refined_reftrack(self,
