@@ -1,6 +1,6 @@
 [project]
 name = "OptiLine-Py"
-version = "0.1.9.6"
+version = "0.2.0"
 description = "Raceline optimisation tools"
 authors = [
     {name = "Amir Ali Farzin", email = "amirali77farzin@gmail.com"}
