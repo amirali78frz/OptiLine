@@ -2567,7 +2567,7 @@ def ShortestPath(reftrack: np.ndarray,
         v_max = 22.88,
         ggv_import_path="maps/ggv.csv",ax_max_machines_import_path="maps/ax_max_machines.csv",
         vel_solver='fb', gg_upper=None, gg_lower=None, gg_range=None,
-        dyn_model_exp=1.0) -> np.ndarray:
+        dyn_model_exp=1.0, n_interp_con: int = 2) -> np.ndarray:
     """
 
     .. description::
@@ -2613,7 +2613,8 @@ def ShortestPath(reftrack: np.ndarray,
     coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((reftrack[:, 0:2], reftrack[0, 0:2])),el_lengths=lengths)
     H, f, G , h = OSP(reftrack=reftrack,
                     normvectors=normvec_norm,
-                    w_veh=w_veh,)
+                    w_veh=w_veh,
+                    A=M, closed=True, n_interp_con=n_interp_con)
     alpha_shpath = quadprog.solve_qp(H, -f, -G.T, -h, 0)[0]
     # sampled_pointss=np.zeros_like(reftrack[:,:2])
     # for i in range(len(alpha_shpath)):
