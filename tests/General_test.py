@@ -1271,6 +1271,118 @@ print("Stage 11 completed.")
 
 
 # ===========================================================================
+# Stage 12 - Interior-point corridor constraints (n_interp_con)
+#            The QPs constrain alpha only AT the reference-track nodes, but the
+#            raceline actually driven is the cubic spline through those nodes,
+#            which bulges outside the corridor between them (~0.11 m on an 18 m
+#            node spacing). Refining the node spacing fixes it but scales the
+#            number of optimisation variables.
+#            SINCE v0.2.3 the spline coefficients solve A @ coeffs = q + M @ alpha,
+#            so the position at any FIXED (segment, t) is affine in alpha; the
+#            constant part cancels when the deviation is measured from the
+#            reference spline at the same (segment, t). Bounding that purely
+#            linear map at a few interior t values adds constraint ROWS while
+#            leaving the number of variables unchanged.
+#            n_interp_con=0 restores the node-only behaviour of v<=0.2.2.
+# ===========================================================================
+print_stage(12, "Interior-point corridor constraints (n_interp_con)")
+
+from OptiLine.utils import interp_corridor_rows, H_f
+
+W_IC = 1.0                       # vehicle width -> per-side clearance W_IC / 2
+N_PTS = reftrack.shape[0]
+
+G_ic, h_ic = interp_corridor_rows(A=M, reftrack=reftrack, normvectors=normvec_norm,
+                                  w_veh=W_IC, closed=True, n_interp_con=2)
+print(f"Reference track       : {N_PTS} nodes")
+print(f"Extra constraint rows : {G_ic.shape} (expected ({2 * 2 * N_PTS}, {N_PTS}))")
+assert G_ic.shape == (2 * 2 * N_PTS, N_PTS)
+assert h_ic.shape == (2 * 2 * N_PTS,)
+
+# disabling it must produce no rows at all
+_G0, _h0 = interp_corridor_rows(A=M, reftrack=reftrack, normvectors=normvec_norm,
+                                w_veh=W_IC, closed=True, n_interp_con=0)
+assert _G0.shape == (0, N_PTS) and _h0.shape == (0,)
+print("  n_interp_con=0 adds no rows              : OK")
+
+# --- (a) sanity: a uniform lateral shift alpha = c moves the interior points by
+#         about c. This is NOT exact, because the spline through the shifted nodes
+#         is not the exact offset of the spline through the original nodes; the
+#         mean is exact and the few-percent spread is that interpolation effect.
+B_ic = G_ic[:N_PTS]              # first block = +deviation at t = 1/3
+assert np.allclose(B_ic @ np.zeros(N_PTS), 0.0, atol=1e-12)
+for _c in (0.25, -0.6):
+    _dev = B_ic @ np.full(N_PTS, _c)
+    print(f"  uniform shift {_c:+.2f} m -> mean {_dev.mean():+.4f} m, "
+          f"max |dev - c| = {np.max(np.abs(_dev - _c)):.4f} m")
+    assert abs(float(_dev.mean()) - _c) < 1e-3
+    assert np.max(np.abs(_dev - _c)) < 0.05 * abs(_c)
+
+# --- (b) helper: deviation of the ACTUAL interpolated raceline at the interior
+#         points, measured from the reference spline at the same (segment, t) -----
+def _actual_interior_dev(alpha, t=1.0 / 3.0):
+    _T = np.array([1.0, t, t ** 2, t ** 3])
+    _, _, _cx, _cy, _, _, _, _, _ = create_raceline(
+        refline=reftrack[:, :2], normvectors=normvec_norm, alpha=alpha,
+        stepsize_interp=1.0)
+    _, _, _rcx, _rcy, _, _, _, _, _ = create_raceline(
+        refline=reftrack[:, :2], normvectors=normvec_norm,
+        alpha=np.zeros(N_PTS), stepsize_interp=1.0)
+    _out = np.empty(N_PTS)
+    for _i in range(N_PTS):
+        _p = np.array([_T @ _cx[_i], _T @ _cy[_i]])
+        _p0 = np.array([_T @ _rcx[_i], _T @ _rcy[_i]])
+        _n = (1.0 - t) * normvec_norm[_i] + t * normvec_norm[(_i + 1) % N_PTS]
+        _out[_i] = (_p - _p0) @ (_n / np.linalg.norm(_n))
+    return _out
+
+# --- (c) backward compatibility and effect on the solution ---------------------
+_qp = dict(reftrack=reftrack, normvectors=normvec_norm, A=M, kappa_bound=0.5,
+           w_veh=W_IC, print_debug=False, plot_debug=False, closed=True)
+_alpha0, _ = solvers.opt_min_curv(n_interp_con=0, **_qp)
+_alpha2, _ = solvers.opt_min_curv(n_interp_con=2, **_qp)
+
+_dev_max = reftrack[:, 2] - W_IC / 2          # same bound the QP uses at the nodes
+
+# (c1) inside the QP's own linear model the constraint is satisfied exactly
+_exc0 = float(np.max(np.abs(B_ic @ _alpha0) - _dev_max))
+_exc2 = float(np.max(np.abs(B_ic @ _alpha2) - _dev_max))
+print(f"  QP-model overshoot,  n_interp_con=0      : {_exc0:+.4f} m")
+print(f"  QP-model overshoot,  n_interp_con=2      : {_exc2:+.4f} m")
+assert _exc2 < _exc0, "interior constraints did not reduce the modelled overshoot"
+assert _exc2 <= 1e-6, "interior points still violate their own constraint"
+
+# (c2) on the ACTUAL interpolated raceline the overshoot is reduced but not zero:
+#      opt_min_curv freezes the spline parameterisation at the reference geometry,
+#      while create_raceline re-fits the spline through the shifted points. That
+#      linearisation gap is the same one reported as curv_error_max by the QP.
+_act0 = float(np.max(np.abs(_actual_interior_dev(_alpha0)) - _dev_max))
+_act2 = float(np.max(np.abs(_actual_interior_dev(_alpha2)) - _dev_max))
+print(f"  actual overshoot,    n_interp_con=0      : {_act0:+.4f} m")
+print(f"  actual overshoot,    n_interp_con=2      : {_act2:+.4f} m  "
+      f"(residual = spline re-fit vs frozen parameterisation)")
+assert _act2 < _act0, "interior constraints did not reduce the actual overshoot"
+print("  interior constraints honoured            : OK")
+
+# --- (d) H_f carries the same option, so the bilevel / blackbox solvers ---------
+#         (Opt_min_CurvTime, Blackbox_raceline) inherit the fix as well
+_Hf = dict(reftrack=reftrack, normvectors=normvec_norm, A=M, kappa_bound=0.5,
+           w_veh=W_IC, closed=True)
+_, _, _Gh0, _ = H_f(n_interp_con=0, **_Hf)
+_, _, _Gh2, _ = H_f(n_interp_con=2, **_Hf)
+print(f"  H_f rows: {_Gh0.shape[0]} (off) -> {_Gh2.shape[0]} (on), "
+      f"delta = {_Gh2.shape[0] - _Gh0.shape[0]} (expected {2 * 2 * N_PTS})")
+assert _Gh2.shape[0] - _Gh0.shape[0] == 2 * 2 * N_PTS
+
+# --- (e) cost of the extra rows -------------------------------------------------
+_t0 = time.time(); solvers.opt_min_curv(n_interp_con=0, **_qp); _dt0 = time.time() - _t0
+_t0 = time.time(); solvers.opt_min_curv(n_interp_con=2, **_qp); _dt2 = time.time() - _t0
+print(f"  QP time: {_dt0:.3f} s (off) -> {_dt2:.3f} s (on), "
+      f"factor {_dt2 / max(_dt0, 1e-9):.2f}x  (variables unchanged, rows added)")
+print("Stage 12 completed.")
+
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 print("\n" + "=" * 60)
