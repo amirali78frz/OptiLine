@@ -1379,6 +1379,23 @@ _t0 = time.time(); solvers.opt_min_curv(n_interp_con=0, **_qp); _dt0 = time.time
 _t0 = time.time(); solvers.opt_min_curv(n_interp_con=2, **_qp); _dt2 = time.time() - _t0
 print(f"  QP time: {_dt0:.3f} s (off) -> {_dt2:.3f} s (on), "
       f"factor {_dt2 / max(_dt0, 1e-9):.2f}x  (variables unchanged, rows added)")
+# --- (f) the solver classes forward the setting --------------------------------
+#         Opt_min_CurvTime and Blackbox_raceline build their inner QP through
+#         H_f / OSP. Before v0.2.4 they did not forward n_interp_con, so they were
+#         pinned to the default regardless of what the caller asked for, and the
+#         minimum-curvature warm start disagreed with opt_min_curv.
+import inspect as _inspect
+for _cls in (solvers.Opt_min_CurvTime, solvers.Blackbox_raceline):
+    assert "n_interp_con" in _inspect.signature(_cls.__init__).parameters, _cls.__name__
+    print(f"  {_cls.__name__:<24} accepts n_interp_con : OK")
+
+_ct_ic = _build_ct(n_interp_con=3)
+assert _ct_ic.n_interp_con == 3
+_alpha3, _ = solvers.opt_min_curv(n_interp_con=3, **_qp)
+_, _, _G3, _ = H_f(n_interp_con=3, **_Hf)
+assert _G3.shape[0] - _Gh0.shape[0] == 2 * 3 * N_PTS
+print(f"  Opt_min_CurvTime stores n_interp_con=3   : OK")
+
 print("Stage 12 completed.")
 
 
