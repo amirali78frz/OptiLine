@@ -655,7 +655,7 @@ class Opt_min_CurvTime:
                  ggv_import_path="maps/ggv.csv", ax_max_machines_import_path="maps/ax_max_machines.csv",
                  fw=3, refine_every=None, refine_subsample=1, vel_solver='fb',
                  gg_upper=None, gg_lower=None, gg_range=None, dyn_model_exp=1.0,
-                 s_scale=None):
+                 s_scale=None, n_interp_con=2):
         """
         Min Curv and Time optimizer.
 
@@ -760,6 +760,7 @@ class Opt_min_CurvTime:
         self.sigma = sigma
         self.popsize = popsize
         self.fw = fw
+        self.n_interp_con = int(n_interp_con)
         self.vel_solver = vel_solver
         self.gg_upper = gg_upper
         self.gg_lower = gg_lower
@@ -914,6 +915,7 @@ class Opt_min_CurvTime:
             path=np.vstack((self.reftrack[:, 0:2], self.reftrack[0, 0:2])),
             el_lengths=ds)
         H, f, G, h = H_f(
+            n_interp_con=self.n_interp_con,
             reftrack=self.reftrack,
             normvectors=normvec_norm,
             A=M_mat,
@@ -969,7 +971,8 @@ class Opt_min_CurvTime:
         kapb = self.kapb
 
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((self.reftrack[:, 0:2], self.reftrack[0, 0:2])),el_lengths=ds)
-        H, f, G , h = H_f(reftrack=self.reftrack,
+        H, f, G , h = H_f(n_interp_con=self.n_interp_con,
+                          reftrack=self.reftrack,
                                                     normvectors=normvec_norm,
                                                     A=M,
                                                     kappa_bound=kapb,
@@ -1279,7 +1282,8 @@ class Opt_min_CurvTime:
             ds, _ = self.CurveLenOpt(solver=solver, refine_every=refine_every)
 
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((self.reftrack[:, 0:2], self.reftrack[0, 0:2])),el_lengths=ds)
-        H, f, G , h = H_f(reftrack=self.reftrack,
+        H, f, G , h = H_f(n_interp_con=self.n_interp_con,
+                          reftrack=self.reftrack,
                                                  normvectors=normvec_norm,
                                                  A=M,
                                                  kappa_bound=self.kapb,
@@ -1335,7 +1339,8 @@ class Opt_min_CurvTime:
         if ds is None:
             ds, _ = self.CurveLenOpt(solver=solver, refine_every=refine_every)
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((self.reftrack[:, 0:2], self.reftrack[0, 0:2])),el_lengths=ds)
-        H, f, G , h = H_f(reftrack=self.reftrack,
+        H, f, G , h = H_f(n_interp_con=self.n_interp_con,
+                          reftrack=self.reftrack,
                                                  normvectors=normvec_norm,
                                                  A=M,
                                                  kappa_bound=self.kapb,
@@ -1443,7 +1448,8 @@ class Opt_min_CurvTime:
         # lengths1 = np.sqrt(np.sum(np.power(np.diff(self.center[:,0:2], axis=0), 2), axis=1))
         # lengths1=np.append(lengths1, lengths1[0])
         coeffs_x, coeffs_y, M, normvec_norm = calc_splines(path=np.vstack((self.center[:, 0:2], self.center[0, 0:2])),el_lengths=lengths1)
-        H, f, G , h = H_f(reftrack=self.center,
+        H, f, G , h = H_f(n_interp_con=self.n_interp_con,
+                          reftrack=self.center,
                                                  normvectors=normvec_norm,
                                                  A=M,
                                                  kappa_bound=self.kapb,
@@ -1761,8 +1767,10 @@ class Blackbox_raceline:
         gg_upper=None,
         gg_lower=None,
         gg_range=None,
+        n_interp_con: int = 2,
     ):
         # ---- store hyper-parameters -------------------------------------------
+        self.n_interp_con  = int(n_interp_con)
         self.reftrack      = reftrack.copy()
         self.N             = reftrack.shape[0]
         self.ggv           = ggv
@@ -1860,6 +1868,7 @@ class Blackbox_raceline:
             # This is the best geometric proxy available and typically a better starting
             # point than a random interior point.
             H, f_vec, G, h_vec = H_f(
+                n_interp_con=self.n_interp_con,
                 reftrack=self.reftrack,
                 normvectors=self._normvec,
                 A=self._M,
@@ -1880,7 +1889,8 @@ class Blackbox_raceline:
                 normvectors=self._normvec,
                 w_veh=2.0 * self.sfty,
                 A=self._M,
-                closed=True)
+                closed=True,
+                n_interp_con=self.n_interp_con)
             alpha_sp = quadprog.solve_qp(H_sp, -f_sp, -G_sp.T, -h_sp, 0)[0]
             # Clip to Blackbox box (OSP and H_f constraints can differ slightly
             # due to numerical tolerances or rounding in dev_max).
