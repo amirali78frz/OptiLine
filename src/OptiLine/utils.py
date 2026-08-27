@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -449,6 +450,25 @@ def create_raceline(refline: np.ndarray,
                                       incl_last_point=False,
                                       stepsize_approx=stepsize_interp)
 
+    # --- discretisation sanity check -------------------------------------------
+    # A reference track with strongly non-uniform node spacing yields a short spline
+    # segment whose cubic has to curl sharply to match its neighbours' tangents. The
+    # resulting curvature spike is a genuine property of that spline, not an artefact
+    # of the interpolation, but it silently corrupts any velocity profile computed
+    # from it. A coarse stepsize_interp may never sample the offending segment, so the
+    # problem can stay hidden until the step size is reduced.
+    _sl_min = float(np.min(spline_lengths_raceline))
+    _sl_max = float(np.max(spline_lengths_raceline))
+    if _sl_min > 0.0 and _sl_max / _sl_min > 5.0:
+        warnings.warn(
+            "create_raceline: reference-track node spacing is strongly non-uniform "
+            "(longest/shortest spline segment = %.1f; shortest = %.3f m at index %d). "
+            "Short segments make the spline curl sharply, which can corrupt the "
+            "curvature and the lap time, especially at small stepsize_interp. "
+            "Re-sample the reference track with (near-)uniform spacing."
+            % (_sl_max / _sl_min, _sl_min, int(np.argmin(spline_lengths_raceline))),
+            RuntimeWarning, stacklevel=2)
+
     # calculate element lengths
     s_tot_raceline = float(np.sum(spline_lengths_raceline))
     el_lengths_raceline_interp = np.diff(s_raceline_interp)
@@ -697,6 +717,21 @@ def calc_head_curv_an(coeffs_x: np.ndarray,
         # calculate curvature kappa
         kappa = (x_d * y_dd - y_d * x_dd) / np.power(np.power(x_d, 2) + np.power(y_d, 2), 1.5)
 
+        # Flag physically impossible curvature. A raceline never has a cornering
+        # radius below ~1 m, so |kappa| > 1.0 1/m indicates a degenerate (very short)
+        # spline segment in the reference track rather than a real corner. Left as a
+        # warning so that existing results are unchanged.
+        if np.size(kappa) > 0:
+            _k_max = float(np.max(np.abs(kappa)))
+            if _k_max > 1.0:
+                warnings.warn(
+                    "calc_head_curv_an: |kappa| reaches %.2f 1/m (radius %.3f m) at "
+                    "index %d, which is far below any physical cornering radius. This "
+                    "usually means the reference track has a degenerate (very short) "
+                    "segment; re-sample it with (near-)uniform spacing."
+                    % (_k_max, 1.0 / _k_max, int(np.argmax(np.abs(kappa)))),
+                    RuntimeWarning, stacklevel=2)
+
     else:
         kappa = 0.0
 
@@ -723,6 +758,93 @@ def calc_head_curv_an(coeffs_x: np.ndarray,
 
 
 
+def interp_corridor_rows(A: np.ndarray,
+                         reftrack: np.ndarray,
+                         normvectors: np.ndarray,
+                         w_veh: float,
+                         closed: bool = True,
+                         n_interp_con: int = 2) -> tuple:
+    """
+    .. description::
+    Build linear inequality rows that keep the *interpolated* raceline inside the
+    track corridor, not merely the raceline at the optimisation nodes.
+
+    The QPs of this module constrain alpha only at the reference-track nodes. The
+    raceline actually driven is the cubic spline through those nodes, and between
+    two nodes that spline bulges outside the corridor -- by up to ~0.27 m on an
+    18 m node spacing. Reducing the node spacing fixes this but scales the number
+    of optimisation variables, which is expensive.
+
+    Instead we exploit the fact that the spline coefficients solve A @ coeffs =
+    q + M @ alpha, so that the position at any FIXED (segment, t) is affine in
+    alpha. Measuring the deviation from the reference spline at the same (segment,
+    t) cancels the constant part, leaving a purely linear map alpha -> deviation.
+    Bounding that map at a few interior t values adds constraint ROWS while
+    leaving the number of variables unchanged.
+
+    .. inputs::
+    :param A:               spline system matrix from calc_splines (same as opt_min_curv).
+    :param reftrack:        reference track [x, y, w_tr_right, w_tr_left].
+    :param normvectors:     normalised normal vectors of the reference track.
+    :param w_veh:           vehicle width in m (per-side clearance is w_veh / 2).
+    :param closed:          whether the track is closed.
+    :param n_interp_con:    number of interior points constrained per spline segment.
+                            0 disables the extra rows and restores the node-only
+                            behaviour; 2 constrains t = 1/3 and t = 2/3.
+
+    .. outputs::
+    :return G_add:          additional inequality rows (2 * n_interp_con * no_splines, no_points).
+    :return h_add:          corresponding right-hand sides.
+    """
+    no_points = reftrack.shape[0]
+    no_splines = no_points if closed else no_points - 1
+
+    if n_interp_con < 1:
+        return np.zeros((0, no_points)), np.zeros(0)
+
+    A_inv = np.linalg.inv(A)
+
+    # M_x / M_y map alpha onto the spline right-hand side (see opt_min_curv)
+    M_x = np.zeros((no_splines * 4, no_points))
+    M_y = np.zeros((no_splines * 4, no_points))
+    rows_0 = np.arange(no_splines) * 4
+    rows_1 = rows_0 + 1
+    cols_0 = np.arange(no_splines)
+    cols_1 = np.arange(1, no_splines + 1) % no_points
+    M_x[rows_0, cols_0] = normvectors[cols_0, 0]
+    M_x[rows_1, cols_1] = normvectors[cols_1, 0]
+    M_y[rows_0, cols_0] = normvectors[cols_0, 1]
+    M_y[rows_1, cols_1] = normvectors[cols_1, 1]
+
+    G_add, h_add = [], []
+    for t in (np.arange(1, n_interp_con + 1) / (n_interp_con + 1.0)):
+        # (E_t @ A_inv), where E_t evaluates [1, t, t^2, t^3] on each spline segment
+        EA = (A_inv[0::4] + t * A_inv[1::4]
+              + t ** 2 * A_inv[2::4] + t ** 3 * A_inv[3::4])
+        D_x = np.matmul(EA, M_x)
+        D_y = np.matmul(EA, M_y)
+
+        # normal direction at the interior point (interpolated between nodes)
+        n_x = (1.0 - t) * normvectors[cols_0, 0] + t * normvectors[cols_1, 0]
+        n_y = (1.0 - t) * normvectors[cols_0, 1] + t * normvectors[cols_1, 1]
+        n_norm = np.hypot(n_x, n_y)
+        n_norm[n_norm < 1e-12] = 1.0
+        n_x, n_y = n_x / n_norm, n_y / n_norm
+
+        # deviation of the interpolated point along that normal (linear in alpha)
+        B = D_x * n_x[:, None] + D_y * n_y[:, None]
+
+        # corridor half-widths at the interior point, linearly interpolated
+        dev_pos = (1.0 - t) * reftrack[cols_0, 2] + t * reftrack[cols_1, 2] - w_veh / 2
+        dev_neg = (1.0 - t) * reftrack[cols_0, 3] + t * reftrack[cols_1, 3] - w_veh / 2
+        dev_pos = np.maximum(dev_pos, 0.001)
+        dev_neg = np.maximum(dev_neg, 0.001)
+
+        G_add.append(B);  h_add.append(dev_pos)
+        G_add.append(-B); h_add.append(dev_neg)
+
+    return np.vstack(G_add), np.concatenate(h_add)
+
 def H_f(reftrack: np.ndarray,
                  normvectors: np.ndarray,
                  A: np.ndarray,
@@ -734,7 +856,8 @@ def H_f(reftrack: np.ndarray,
                  psi_s: float = None,
                  psi_e: float = None,
                  fix_s: bool = False,
-                 fix_e: bool = False) -> tuple:
+                 fix_e: bool = False,
+                 n_interp_con: int = 2) -> tuple:
 
     """
     .. description::
@@ -939,8 +1062,13 @@ def H_f(reftrack: np.ndarray,
     h = np.append(dev_max_right, dev_max_left)
     h = np.append(h, con_stack)
 
-    # G = np.vstack((np.eye(no_points), -np.eye(no_points)))
-    # h = np.append(dev_max_right, dev_max_left)
+    # keep the INTERPOLATED spline inside the corridor as well, not only the nodes
+    G_ic, h_ic = interp_corridor_rows(A=A, reftrack=reftrack, normvectors=normvectors,
+                                      w_veh=w_veh, closed=closed,
+                                      n_interp_con=n_interp_con)
+    if G_ic.shape[0] > 0:
+        G = np.vstack((G, G_ic))
+        h = np.append(h, h_ic)
 
     return H , f, G ,h
 

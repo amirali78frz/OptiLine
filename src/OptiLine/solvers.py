@@ -6,6 +6,9 @@ import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 
+
+
+
 def opt_min_curv(reftrack: np.ndarray,
                  normvectors: np.ndarray,
                  A: np.ndarray,
@@ -17,7 +20,8 @@ def opt_min_curv(reftrack: np.ndarray,
                  psi_s: float = None,
                  psi_e: float = None,
                  fix_s: bool = False,
-                 fix_e: bool = False) -> tuple:
+                 fix_e: bool = False,
+                 n_interp_con: int = 2) -> tuple:
     """
 
     .. description::
@@ -265,6 +269,14 @@ def opt_min_curv(reftrack: np.ndarray,
     G = np.vstack((np.eye(no_points), -np.eye(no_points), E_kappa, -E_kappa))
     h = np.append(dev_max_right, dev_max_left)
     h = np.append(h, con_stack)
+
+    # keep the INTERPOLATED spline inside the corridor as well, not only the nodes
+    G_ic, h_ic = interp_corridor_rows(A=A, reftrack=reftrack, normvectors=normvectors,
+                                      w_veh=w_veh, closed=closed,
+                                      n_interp_con=n_interp_con)
+    if G_ic.shape[0] > 0:
+        G = np.vstack((G, G_ic))
+        h = np.append(h, h_ic)
 
     # save start time
     t_start = time.perf_counter()
@@ -583,7 +595,7 @@ class ZORM:
         self.history   = history
         return x
     
-from OptiLine.utils import calc_splines,create_raceline, calc_head_curv_an, H_f, import_veh_dyn_info
+from OptiLine.utils import calc_splines,create_raceline, calc_head_curv_an, H_f, import_veh_dyn_info, interp_corridor_rows
 from OptiLine.KinematicProfs import calc_vel_profile, calc_vel_profile_solver, calc_ax_profile, calc_t_profile , cumulative_distances
 
 # ---------------------------------------------------------------------------
@@ -1866,7 +1878,9 @@ class Blackbox_raceline:
             H_sp, f_sp, G_sp, h_sp = OSP(
                 reftrack=self.reftrack,
                 normvectors=self._normvec,
-                w_veh=2.0 * self.sfty)
+                w_veh=2.0 * self.sfty,
+                A=self._M,
+                closed=True)
             alpha_sp = quadprog.solve_qp(H_sp, -f_sp, -G_sp.T, -h_sp, 0)[0]
             # Clip to Blackbox box (OSP and H_f constraints can differ slightly
             # due to numerical tolerances or rounding in dev_max).
@@ -2452,7 +2466,10 @@ class Clothoid_raceline:
 def OSP(reftrack: np.ndarray,
                       normvectors: np.ndarray,
                       w_veh: float,
-                      print_debug: bool = False) -> np.ndarray:
+                      print_debug: bool = False,
+                      A: np.ndarray = None,
+                      closed: bool = True,
+                      n_interp_con: int = 2) -> np.ndarray:
     """
 
     .. description::
@@ -2520,6 +2537,16 @@ def OSP(reftrack: np.ndarray,
     # consider value boundaries (-dev_max <= alpha <= dev_max)
     G = np.vstack((np.eye(no_points), -np.eye(no_points)))
     h = np.ones(2 * no_points) * np.append(dev_max_right, dev_max_left)
+
+    # keep the INTERPOLATED spline inside the corridor as well (needs the spline
+    # system matrix A; without it only the nodes are constrained, as before)
+    if A is not None and n_interp_con > 0:
+        G_ic, h_ic = interp_corridor_rows(A=A, reftrack=reftrack, normvectors=normvectors,
+                                          w_veh=w_veh, closed=closed,
+                                          n_interp_con=n_interp_con)
+        if G_ic.shape[0] > 0:
+            G = np.vstack((G, G_ic))
+            h = np.append(h, h_ic)
 
     return H,f,G,h
 
