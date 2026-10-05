@@ -1,5 +1,6 @@
 import numpy as np
 import math
+import warnings
 import matplotlib.pyplot as plt
 import quadprog
 import time
@@ -595,7 +596,7 @@ class ZORM:
         self.history   = history
         return x
     
-from OptiLine.utils import calc_splines,create_raceline, calc_head_curv_an, H_f, import_veh_dyn_info, interp_corridor_rows
+from OptiLine.utils import calc_splines,create_raceline, calc_head_curv_an, H_f, import_veh_dyn_info, interp_corridor_rows, reftrack_to_mlts_track
 from OptiLine.KinematicProfs import calc_vel_profile, calc_vel_profile_solver, calc_ax_profile, calc_t_profile , cumulative_distances
 
 # ---------------------------------------------------------------------------
@@ -2712,3 +2713,356 @@ def ShortestPath(reftrack: np.ndarray,
 
     
     return raceline_interp,alpha_shpath,s_splines,vx_profile_opt_cl,ax_profile_opt,kappa_opt,t_profile_cl
+
+# ===========================================================================
+# Point-mass minimum-lap-time OCP  (external solver: MLTS-point-mass)
+# ===========================================================================
+# Thin OptiLine front end for the MLTS-point-mass package by G. Corradini
+# (https://pypi.org/project/MLTS-point-mass/). That package solves the minimum
+# lap time of a point mass in curvilinear coordinates with CasADi/IPOPT, subject
+# to a g-g-v envelope and first-order acceleration lags; this wrapper feeds it an
+# ordinary OptiLine reference track and a g-g-v in either of the two formats used
+# in OptiLine, and returns the result in the same form as the other solvers here.
+#
+# MLTS-point-mass is a required dependency of OptiLine (since v0.2.6), but it is
+# imported only when PointMassOCP is actually constructed, exactly as fbga-py is
+# imported only by the fb2d velocity profiler. That keeps the rest of the package
+# usable when the running interpreter is not the one OptiLine was installed into.
+# ===========================================================================
+
+def _require_mlts():
+    """Import MLTS-point-mass on demand and explain how to get it if missing.
+
+    MLTS-point-mass is a required dependency of OptiLine, so this normally
+    succeeds. It is still imported here rather than at module level, exactly like
+    fbga-py, so that the rest of the package keeps working if the install is
+    incomplete or the environment is not the one OptiLine was installed into (a
+    virtualenv without access to the system site-packages is the usual cause).
+    """
+    try:
+        from mlts_point_mass import MLTS
+    except ImportError as exc:                                  # pragma: no cover
+        import sys
+        raise ImportError(
+            "PointMassOCP needs the MLTS-point-mass solver, which is a dependency "
+            "of OptiLine but is not importable from this interpreter:\n"
+            "    %s\n"
+            "Install it into THIS environment with\n"
+            "    %s -m pip install MLTS-point-mass\n"
+            "or, from the OptiLine source tree, re-run 'poetry install'."
+            % (sys.executable, sys.executable)
+        ) from exc
+    return MLTS
+
+
+def ggv_table_to_mlts_samples(ggv: np.ndarray,
+                              ax_max_machines: np.ndarray = None,
+                              dyn_model_exp: float = 2.0,
+                              n_ay: int = 25) -> dict:
+    """
+
+    .. description::
+    Convert OptiLine's point-mass g-g-v table into the boundary samples accepted by
+    MLTS-point-mass, so that the OCP can be run on exactly the same envelope as
+    calc_vel_profile and the geometric solvers.
+
+    The OptiLine point-mass model couples the longitudinal and lateral capacities
+    through the exponent e,
+        ax_avail(ay, v) = ax_max(v) * (1 - (|ay| / ay_max(v))**e)**(1/e),
+    with the drive side additionally capped by ax_max_machines(v). This function
+    walks that boundary for every tabulated speed and returns the resulting
+    (V, ax, ay) samples.
+
+    If a full g-g-v envelope in the shared JSON form is available (the dict with the
+    keys 'longitudinal_acceleration' and 'lateral_acceleration'), pass it straight to
+    PointMassOCP instead: it is richer than this reconstruction, which can only
+    describe an e-superellipse.
+
+    .. inputs::
+    :param ggv:             point-mass g-g-v table [v, ax_max, ay_max], shape (n, 3).
+    :type ggv:              np.ndarray
+    :param ax_max_machines: optional drive limit [v, ax_max_machines], shape (n, 2).
+    :type ax_max_machines:  np.ndarray
+    :param dyn_model_exp:   exponent e of the acceleration envelope (1 = diamond, 2 = ellipse).
+    :type dyn_model_exp:    float
+    :param n_ay:            number of lateral samples per speed used to walk the boundary.
+    :type n_ay:             int
+
+    .. outputs::
+    :return samples:        dict with the keys 'V', 'ax' and 'ay' holding the boundary samples.
+    :rtype samples:         dict
+    """
+
+    ggv = np.asarray(ggv, dtype=float)
+    if ggv.ndim != 2 or ggv.shape[1] != 3:
+        raise ValueError("ggv must be of shape (n, 3): [v, ax_max, ay_max]")
+    if n_ay < 3:
+        raise ValueError("n_ay must be at least 3 (MLTS needs >= 3 samples per speed)")
+
+    v_vec, ax_max_vec, ay_max_vec = ggv[:, 0], ggv[:, 1], ggv[:, 2]
+    e = float(dyn_model_exp)
+
+    V_s, ax_s, ay_s = [], [], []
+    for v, ax_max, ay_max in zip(v_vec, ax_max_vec, ay_max_vec):
+        if ax_max <= 0.0 or ay_max <= 0.0:
+            continue
+        ax_drive = ax_max
+        if ax_max_machines is not None:
+            ax_drive = min(ax_max, float(np.interp(v, np.asarray(ax_max_machines)[:, 0],
+                                                   np.asarray(ax_max_machines)[:, 1])))
+        ay = np.linspace(0.0, ay_max, n_ay)
+        # available longitudinal acceleration on the e-superellipse
+        ratio = np.clip(1.0 - np.power(ay / ay_max, e), 0.0, None)
+        ax_avail = ax_max * np.power(ratio, 1.0 / e)
+        for a_y, a_x in zip(ay, ax_avail):
+            V_s.append(v); ax_s.append(min(a_x, ax_drive)); ay_s.append(a_y)   # drive side
+            V_s.append(v); ax_s.append(-a_x);               ay_s.append(a_y)   # brake side
+
+    if not V_s:
+        raise ValueError("ggv contains no row with positive ax_max and ay_max")
+
+    return {"V": np.asarray(V_s), "ax": np.asarray(ax_s), "ay": np.asarray(ay_s)}
+
+
+class PointMassOCP:
+    """
+
+    .. description::
+    Minimum-lap-time raceline of a point mass, solved with the external
+    MLTS-point-mass package on an OptiLine reference track.
+
+    Unlike the geometric (opt_min_curv, OSP) and zeroth-order (Opt_min_CurvTime,
+    Blackbox_raceline) solvers, the path and the speed profile are optimised
+    together here: the states are the lateral offset n, the relative heading Xi, the
+    speed V and the two accelerations ax, ay, the controls are the commanded
+    accelerations, and the g-g-v enters as the path constraint g(ax, ay, V) <= 1.
+    The accelerations follow their commands through first-order lags tau_ax, tau_ay,
+    so, unlike a forward-backward velocity profiler, the result cannot jump
+    instantaneously between full braking and full drive.
+
+    The reference track is converted with utils.reftrack_to_mlts_track, which fits
+    the usual OptiLine closed cubic splines, so the abscissa, the heading and the
+    curvature handed to the OCP all describe the same curve and the curvilinear lap
+    time agrees with the lap time implied by the returned (x, y) path.
+
+    RESOLUTION. The solver splines the reference line through the rows of that table.
+    The table must therefore be fine enough for its own curvature: aim for
+    max|kappa| * spacing <= 0.5. A coarser track is accepted but warned about, since
+    the reference-line spline then cuts the corners and the lap time disagrees with
+    the one implied by the returned (x, y) path (0.5 % at kappa * spacing = 1.5,
+    0.08 % at 0.8, 0.01 % at 0.4). The attribute `kappa_h` reports the value in use.
+
+    .. inputs::
+    :param reftrack:        reference track [x, y, w_tr_right, w_tr_left] in m (unclosed).
+    :type reftrack:         np.ndarray
+    :param ggv:             either the full envelope as a dict with the keys
+                            'longitudinal_acceleration' and 'lateral_acceleration',
+                            or an OptiLine point-mass table [v, ax_max, ay_max].
+    :type ggv:              dict or np.ndarray
+    :param w_veh:           full vehicle width in m; the corridor is thinned by w_veh / 2.
+    :type w_veh:            float
+    :param v_max:           maximum speed in m/s.
+    :type v_max:            float
+    :param v_min:           minimum speed in m/s, defaults to 5.0.
+    :type v_min:            float
+    :param tau_ax:          first-order lag of the longitudinal acceleration in s.
+    :type tau_ax:           float
+    :param tau_ay:          first-order lag of the lateral acceleration in s.
+    :type tau_ay:           float
+    :param ax_max_machines: optional drive limit [v, ax_max_machines], only used when
+                            `ggv` is an OptiLine table.
+    :type ax_max_machines:  np.ndarray
+    :param dyn_model_exp:   envelope exponent, only used when `ggv` is an OptiLine table.
+    :type dyn_model_exp:    float
+    :param ggv_scales:      optional grip scales passed through to the solver, either
+                            [mu], [mu_ax, mu_ay] or [mu_ax_max, mu_ax_min, mu_ay].
+    :type ggv_scales:       list or np.ndarray
+
+    .. outputs::
+    The results of the last solve() call are available as attributes: raceline,
+    alpha, kappa, el_lengths, s, vx_profile, ax_profile, ay_profile, t_profile,
+    laptime, solver_info and sol (the raw dictionary returned by MLTS-point-mass).
+    """
+
+    def __init__(self,
+                 reftrack: np.ndarray,
+                 ggv,
+                 w_veh: float,
+                 v_max: float,
+                 v_min: float = 5.0,
+                 tau_ax: float = 0.03,
+                 tau_ay: float = 0.03,
+                 ax_max_machines: np.ndarray = None,
+                 dyn_model_exp: float = 2.0,
+                 ggv_scales=None):
+
+        MLTS = _require_mlts()
+
+        self.reftrack = np.asarray(reftrack, dtype=float)
+        self.w_veh = float(w_veh)
+        self.track_df = reftrack_to_mlts_track(self.reftrack)
+
+        # g-g-v: pass the full envelope straight through, rebuild the boundary from
+        # an OptiLine table otherwise
+        if isinstance(ggv, dict):
+            self.ggv_data = ggv
+        else:
+            self.ggv_data = ggv_table_to_mlts_samples(ggv,
+                                                      ax_max_machines=ax_max_machines,
+                                                      dyn_model_exp=dyn_model_exp)
+
+        self.vehicle_data = {"W_total": self.w_veh,
+                             "v_max": float(v_max),
+                             "v_min": float(v_min),
+                             "tau_ax": float(tau_ax),
+                             "tau_ay": float(tau_ay)}
+
+        # The solver splines the reference line through the rows of the track table
+        # and evaluates it at the mesh nodes. If the table is too coarse for its own
+        # curvature, that spline does not follow the curve and the driven path comes
+        # out longer than the curvilinear states imply: on a track sampled at
+        # kappa * h = 1.5 the lap time read off the returned (x, y) disagrees with
+        # the reported one by ~0.5 %, falling to ~0.01 % once kappa * h <= 0.5.
+        _h = float(np.median(np.diff(self.track_df["abscissa"].values)))
+        _kh = float(np.max(np.abs(self.track_df["curvature"].values))) * _h
+        self.kappa_h = _kh
+        if _kh > 0.5:
+            warnings.warn(
+                "PointMassOCP: the reference track is coarse for its curvature "
+                "(max|kappa| * spacing = %.2f, spacing %.2f m). The reference line "
+                "spline will not follow the curve, and the lap time will disagree "
+                "with the one implied by the returned (x, y) path by roughly "
+                "%.1f %%. Pass a finer reference track (aim for "
+                "max|kappa| * spacing <= 0.5)." % (_kh, _h, 100 * 0.005 * _kh / 1.5),
+                RuntimeWarning, stacklevel=2)
+
+        self._mlts = MLTS(self.track_df, self.vehicle_data, self.ggv_data,
+                          ggv_scales=ggv_scales)
+
+        # filled in by solve()
+        self.sol = None
+        self.solver_info = None
+        self.raceline = None
+        self.alpha = None
+        self.kappa = None
+        self.el_lengths = None
+        self.s = None
+        self.vx_profile = None
+        self.ax_profile = None
+        self.ay_profile = None
+        self.t_profile = None
+        self.laptime = None
+
+    # ------------------------------------------------------------------
+    @property
+    def track_length(self) -> float:
+        """Arc length of the reference line in m."""
+        return float(self.track_df["abscissa"].values[-1])
+
+    # ------------------------------------------------------------------
+    def solve(self,
+              x0=None,
+              mesh=1.0,
+              weights: dict = None,
+              ipopt_options: dict = None,
+              verbose: bool = False):
+        """
+
+        .. description::
+        Solve the minimum-lap-time problem and store the result on this object.
+
+        .. inputs::
+        :param x0:            constant initial guess [n, Xi, V, ax, ay]. Defaults to
+                              the centre line at 60 % of v_max with zero accelerations.
+        :type x0:             list or np.ndarray
+        :param mesh:          uniform mesh step in m, or an array of mesh nodes along
+                              the abscissa running from 0 to the track length.
+        :type mesh:           float or np.ndarray
+        :param weights:       cost weights w__T (lap time), w__ax and w__ay (control rate).
+        :type weights:        dict
+        :param ipopt_options: IPOPT options, merged with the solver defaults.
+        :type ipopt_options:  dict
+        :param verbose:       if False (default) the IPOPT log is suppressed.
+        :type verbose:        bool
+
+        .. outputs::
+        :return sol:          raw solution dictionary returned by MLTS-point-mass.
+        :rtype sol:           dict
+        """
+
+        if x0 is None:
+            x0 = [0.0, 0.0, 0.6 * self.vehicle_data["v_max"], 0.0, 0.0]
+
+        opts = {"ipopt.print_level": 0, "print_time": 0} if not verbose else {}
+        if ipopt_options:
+            opts.update(ipopt_options)
+
+        sol = self._mlts.solution(x0=x0, mesh=mesh, weights=weights, ipopt_options=opts)
+
+        self.sol = sol
+        self.solver_info = {k: sol[k] for k in ("success", "status", "iterations", "solve_time")}
+        if not sol["success"]:
+            warnings.warn(
+                "PointMassOCP: the OCP did not converge (%s); the last iterate is "
+                "returned. Try a coarser mesh, a different initial guess x0, or a "
+                "larger control-rate weight." % sol["status"],
+                RuntimeWarning, stacklevel=2)
+
+        # OptiLine-side quantities. The driven path is already Cartesian, so the
+        # travelled distance and the lap time are consistent with it by construction.
+        self.raceline = np.column_stack([sol["x_trj"], sol["y_trj"]])
+        self.alpha = -np.asarray(sol["n"], dtype=float)     # OptiLine normals point right
+        self.kappa = np.asarray(sol["kappa_trj"], dtype=float)
+        self.s = np.asarray(sol["distance"], dtype=float)
+        self.el_lengths = np.diff(self.s)
+        self.vx_profile = np.asarray(sol["V"], dtype=float)
+        self.ax_profile = np.asarray(sol["ax"], dtype=float)
+        self.ay_profile = np.asarray(sol["ay"], dtype=float)
+        self.t_profile = np.asarray(sol["time"], dtype=float)
+        self.laptime = float(self.t_profile[-1])
+
+        return sol
+
+    # ------------------------------------------------------------------
+    def generate_kinProfs(self, **kwargs):
+        """
+
+        .. description::
+        Solve if necessary and return the kinematic profiles in the same order as
+        Opt_min_CurvTime.generate_kinProfs and Blackbox_raceline.generate_raceline,
+        so that this solver can be dropped into the same comparison code.
+
+        .. outputs::
+        :return s:          travelled distance along the raceline in m.
+        :return vx:         speed profile in m/s.
+        :return ax:         longitudinal acceleration profile in m/s2.
+        :return kappa:      curvature of the raceline in 1/m.
+        :return t_profile:  cumulative lap time in s.
+        :return raceline:   raceline coordinates [x, y] in m.
+        """
+        if self.sol is None:
+            self.solve(**kwargs)
+        return (self.s, self.vx_profile, self.ax_profile,
+                self.kappa, self.t_profile, self.raceline)
+
+    # ------------------------------------------------------------------
+    def envelope_usage(self):
+        """
+
+        .. description::
+        Fraction of the lap spent on the g-g-v boundary, as the solver's own
+        constraint value g(ax, ay, V). g = 1 is the boundary, g < 1 is inside.
+        Useful as a sanity check that the solution really exploits the envelope.
+
+        .. outputs::
+        :return stats: dict with the keys 'g_max', 'g_mean' and 'frac_on_boundary'
+                       (fraction of nodes with g > 0.99).
+        :rtype stats:  dict
+        """
+        if self.sol is None:
+            raise RuntimeError("call solve() first")
+        g = np.asarray(self._mlts.ggv.g(
+            np.vstack([self.ax_profile, self.ay_profile, self.vx_profile]))).ravel()
+        return {"g_max": float(np.max(g)),
+                "g_mean": float(np.mean(g)),
+                "frac_on_boundary": float(np.mean(g > 0.99))}

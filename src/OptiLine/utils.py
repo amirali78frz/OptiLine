@@ -717,21 +717,6 @@ def calc_head_curv_an(coeffs_x: np.ndarray,
         # calculate curvature kappa
         kappa = (x_d * y_dd - y_d * x_dd) / np.power(np.power(x_d, 2) + np.power(y_d, 2), 1.5)
 
-        # Flag physically impossible curvature. A raceline never has a cornering
-        # radius below ~1 m, so |kappa| > 1.0 1/m indicates a degenerate (very short)
-        # spline segment in the reference track rather than a real corner. Left as a
-        # warning so that existing results are unchanged.
-        if np.size(kappa) > 0:
-            _k_max = float(np.max(np.abs(kappa)))
-            if _k_max > 1.0:
-                warnings.warn(
-                    "calc_head_curv_an: |kappa| reaches %.2f 1/m (radius %.3f m) at "
-                    "index %d, which is far below any physical cornering radius. This "
-                    "usually means the reference track has a degenerate (very short) "
-                    "segment; re-sample it with (near-)uniform spacing."
-                    % (_k_max, 1.0 / _k_max, int(np.argmax(np.abs(kappa)))),
-                    RuntimeWarning, stacklevel=2)
-
     else:
         kappa = 0.0
 
@@ -1782,3 +1767,113 @@ def prep_track(reftrack_imp: np.ndarray,
               " order to match the requirements!", file=sys.stderr)
 
     return reftrack_interp, normvec_normalized_interp, a_interp, coeffs_x_interp, coeffs_y_interp
+
+
+def reftrack_to_mlts_track(reftrack: np.ndarray,
+                           elevation: np.ndarray = None,
+                           slope: np.ndarray = None,
+                           banking: np.ndarray = None):
+    """
+
+    .. description::
+    Convert an OptiLine reference track into the track table expected by the external
+    point-mass minimum-lap-time solver MLTS-point-mass (see solvers.PointMassOCP).
+
+    The reference line is fitted with the same closed cubic splines used everywhere
+    else in OptiLine, so the arc length ("abscissa"), the heading and the curvature
+    all describe one and the same curve. This matters: a track table whose abscissa
+    disagrees with its own tabulated coordinates makes the curvilinear lap time
+    differ from the lap time implied by the exported (x, y) path, by exactly the
+    ratio between the two length scales.
+
+    Conventions. OptiLine stores the heading as psi = atan2(dy, dx) - pi/2 (psi = 0
+    is north) and its normal vectors point to the RIGHT of the direction of travel,
+    whereas MLTS-point-mass expects dir_mid_line = atan2(dy, dx) and a lateral
+    coordinate n that is positive to the LEFT. Both are handled here, so the lateral
+    offset n returned by the solver relates to an OptiLine lateral shift by
+    alpha = -n.
+
+    If the last point of `reftrack` duplicates the first, it is dropped before the
+    splines are fitted: keeping it would leave a near-zero-length closing segment,
+    which produces a spurious curvature spike at the seam.
+
+    .. inputs::
+    :param reftrack:    reference track [x, y, w_tr_right, w_tr_left] in m (unclosed).
+    :type reftrack:     np.ndarray
+    :param elevation:   optional elevation of every reference point in m (default 0).
+    :type elevation:    np.ndarray
+    :param slope:       optional slope angle of every reference point in rad (default 0).
+    :type slope:        np.ndarray
+    :param banking:     optional banking angle of every reference point in rad (default 0).
+    :type banking:      np.ndarray
+
+    .. outputs::
+    :return track:      pandas DataFrame with the columns abscissa, curvature,
+                        dir_mid_line, x_mid_line, y_mid_line, width_no_kerbs_L,
+                        width_no_kerbs_R, elevation, slope and banking. The last row
+                        repeats the first one, so that the table describes a closed lap.
+    :rtype track:       pandas.DataFrame
+    """
+
+    try:
+        import pandas as pd
+    except ImportError as exc:                                  # pragma: no cover
+        raise ImportError(
+            "reftrack_to_mlts_track requires pandas. It is installed together with "
+            "the MLTS-point-mass solver:\n"
+            "    pip install MLTS-point-mass"
+        ) from exc
+
+    reftrack = np.asarray(reftrack, dtype=float)
+    if reftrack.ndim != 2 or reftrack.shape[1] < 4:
+        raise ValueError("reftrack must be of shape (n, 4): [x, y, w_tr_right, w_tr_left]")
+
+    # drop a duplicated closing point (it would create a degenerate spline segment)
+    spacing = np.median(np.hypot(*np.diff(reftrack[:, :2], axis=0).T))
+    if np.hypot(*(reftrack[-1, :2] - reftrack[0, :2])) < 0.5 * spacing:
+        reftrack = reftrack[:-1]
+
+    n_pts = reftrack.shape[0]
+
+    def _closed(col, default):
+        if col is None:
+            return np.full(n_pts + 1, float(default))
+        col = np.asarray(col, dtype=float)[:n_pts]
+        return np.append(col, col[0])
+
+    # closed cubic splines through the reference line
+    path = np.vstack((reftrack[:, :2], reftrack[0, :2]))
+    el_lengths = np.hypot(*np.diff(path, axis=0).T)
+    coeffs_x, coeffs_y, _, _ = calc_splines(path=path, el_lengths=el_lengths)
+
+    # arc length of the reference line (NOT the chord polyline)
+    spline_lengths = calc_spline_lengths(coeffs_x=coeffs_x, coeffs_y=coeffs_y)
+    abscissa = np.concatenate(([0.0], np.cumsum(spline_lengths)))
+
+    # heading and curvature at the spline start points, i.e. at the track nodes
+    no_splines = coeffs_x.shape[0]
+    psi, kappa = calc_head_curv_an(coeffs_x=coeffs_x,
+                                   coeffs_y=coeffs_y,
+                                   ind_spls=np.arange(no_splines),
+                                   t_spls=np.zeros(no_splines))
+
+    # close the lap: node N repeats node 0
+    psi = np.append(psi, psi[0])
+    kappa = np.append(kappa, kappa[0])
+
+    # OptiLine psi is north-zero, MLTS-point-mass wants atan2(dy, dx); unwrap so that
+    # the solver can spline the heading across the +/-pi branch cut
+    dir_mid_line = np.unwrap(psi + math.pi / 2.0)
+
+    return pd.DataFrame({
+        "abscissa":         abscissa,
+        "curvature":        kappa,
+        "dir_mid_line":     dir_mid_line,
+        "x_mid_line":       path[:, 0],
+        "y_mid_line":       path[:, 1],
+        "width_no_kerbs_L": _closed(reftrack[:, 3], 0.0),       # left  half-width
+        "width_no_kerbs_R": _closed(reftrack[:, 2], 0.0),       # right half-width
+        "elevation":        _closed(elevation, 0.0),
+        "slope":            _closed(slope, 0.0),
+        "banking":          _closed(banking, 0.0),
+    })

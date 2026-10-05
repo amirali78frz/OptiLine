@@ -5,7 +5,11 @@ from scipy.interpolate import splprep, splev
 
 try:
     from numba import njit as _njit
-except ImportError:
+except Exception:                        # noqa: BLE001
+    # Not just ImportError: an installed-but-broken numba (e.g. a version
+    # mismatch with one of its own dependencies) raises AttributeError or
+    # similar while importing, and that must not take the whole package down.
+    # Falling back to pure Python only costs speed.
     def _njit(fn=None, **_):             # transparent no-op fallback
         return fn if fn is not None else lambda f: f
 
