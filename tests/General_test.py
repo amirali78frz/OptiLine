@@ -14,12 +14,14 @@ Stages
   Stage 6 : Full optimization comparison – ZO vs CMA-ES  (Opt_min_CurvTime.Comparison)
   Stage 7 : Re-optimization on a refined reference track
   Stage 8 : Blackbox_raceline – direct alpha optimisation (ZO + CMA-ES)
+  Stage 13: PointMassOCP – point-mass minimum-lap-time OCP (optional MLTS dependency)
 
 Run from the tests/ directory:
     cd tests && python General_test.py
 """
 
 import time
+import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -1399,6 +1401,212 @@ print(f"  Opt_min_CurvTime stores n_interp_con=3   : OK")
 print("Stage 12 completed.")
 
 
+
+# ===========================================================================
+print_stage(13, "PointMassOCP - point-mass minimum-lap-time OCP")
+# ===========================================================================
+# solvers.PointMassOCP wraps the external MLTS-point-mass package, which is a
+# REQUIRED dependency of OptiLine. This stage therefore fails loudly rather than
+# skipping: a missing import here almost always means the tests are being run from
+# a different interpreter than the one OptiLine was installed into (for example the
+# system python instead of the poetry virtualenv, which does not see the user
+# site-packages).
+#
+# What is checked:
+#   (a) utils.reftrack_to_mlts_track produces a SELF-CONSISTENT track table, i.e.
+#       its abscissa is the arc length of the very curve its coordinates describe.
+#       Only the chord-to-arc difference may remain.
+#   (b) the heading and curvature columns agree with the geometry.
+#   (c) a duplicated closing point is dropped instead of becoming a degenerate
+#       spline segment with a spurious curvature spike.
+#   (d) the solved raceline respects the corridor thinned by w_veh / 2.
+#   (e) the solution stays inside the g-g-v envelope, g(ax, ay, V) <= 1.
+#   (f) the curvilinear lap time agrees with the time implied by the returned
+#       (x, y) path - this is what a track table with an inconsistent abscissa
+#       would break.
+#   (g) an OptiLine [v, ax_max, ay_max] table can be used instead of a full envelope.
+#   (h) generate_kinProfs returns profiles of consistent length.
+t_pm = None
+try:
+    import mlts_point_mass as _mlts_mod
+except ImportError as _exc:
+    import sys as _sys
+    raise ImportError(
+        "MLTS-point-mass is a required dependency of OptiLine but is not importable "
+        f"from this interpreter:\n    {_sys.executable}\n"
+        f"Install it here with\n    {_sys.executable} -m pip install MLTS-point-mass\n"
+        "or, from the OptiLine source tree, re-run 'poetry install' and run the "
+        "tests with 'poetry run python tests/General_test.py'."
+    ) from _exc
+
+print(f"  MLTS-point-mass version {getattr(_mlts_mod, '__version__', '?')}")
+
+# same vehicle as the geometric stages above (w_veh = 1.0 m, v_max = 22.88 m/s)
+PM_W_VEH, PM_V_MAX = 1.0, 22.88
+
+# --- (a)/(b) the converted track table --------------------------------
+_tr = utils.reftrack_to_mlts_track(reftrack)   # the coarse subsample is fine here
+_need = {"abscissa", "curvature", "dir_mid_line", "x_mid_line", "y_mid_line",
+         "width_no_kerbs_L", "width_no_kerbs_R", "elevation", "slope", "banking"}
+assert _need.issubset(set(_tr.columns)), sorted(_need - set(_tr.columns))
+# the table always closes the lap; a reference track whose last point already
+# duplicates the first keeps its length, otherwise one row is appended
+_spacing = np.median(np.hypot(*np.diff(reftrack[:, :2], axis=0).T))
+_was_closed = np.hypot(*(reftrack[-1, :2] - reftrack[0, :2])) < 0.5 * _spacing
+assert len(_tr) == reftrack.shape[0] + (0 if _was_closed else 1), len(_tr)
+assert np.allclose(_tr[["x_mid_line", "y_mid_line"]].values[0],
+                   _tr[["x_mid_line", "y_mid_line"]].values[-1]), "lap is not closed"
+print(f"  track table: {len(_tr)} rows, closed "
+      f"(input {'already closed' if _was_closed else 'open'})")
+
+_xy = np.column_stack([_tr["x_mid_line"].values, _tr["y_mid_line"].values])
+_chord_i = np.hypot(*np.diff(_xy, axis=0).T)
+_chord = _chord_i.sum()
+_arc = _tr["abscissa"].values[-1]
+
+# The abscissa may only exceed the chord polyline by the chord-to-arc term of
+# the table's OWN curvature: for a circular arc, s = c * (1 + (kappa*c)^2 / 24).
+# Comparing against that prediction instead of a fixed ratio keeps the test
+# valid on coarsely sampled, tight tracks, and is exactly the check that
+# catches a track table whose abscissa belongs to a different curve.
+_kap_i = 0.5 * (np.abs(_tr["curvature"].values[:-1])
+                + np.abs(_tr["curvature"].values[1:]))
+_arc_pred = float(np.sum(_chord_i * (1.0 + (_kap_i * _chord_i) ** 2 / 24.0)))
+_rel = abs(_arc - _arc_pred) / _arc_pred
+print(f"  abscissa {_arc:.3f} m, chord polyline {_chord:.3f} m, "
+      f"chord-to-arc prediction {_arc_pred:.3f} m -> {100 * _rel:.3f} % off")
+assert _rel < 0.002, (
+    f"abscissa is not the arc length of its own coordinates ({100 * _rel:.2f} % off)")
+
+# The heading must match the geometry. On a coarse, tight track a single
+# segment can turn by ~85 deg, so the per-node spread is large and only the
+# MEDIAN is meaningful: a wrong convention (pi/2 offset or flipped sign)
+# shifts the median to ~1.57 rad, two orders of magnitude above a correct one.
+_cen = np.arctan2(_xy[2:, 1] - _xy[:-2, 1], _xy[2:, 0] - _xy[:-2, 0])
+_dh = np.abs(np.angle(np.exp(1j * (_tr["dir_mid_line"].values[1:-1] - _cen))))
+print(f"  dir_mid_line vs central difference : median {np.median(_dh):.4f} rad, "
+      f"max {_dh.max():.4f} rad")
+assert np.median(_dh) < 0.15, "dir_mid_line does not match the tabulated coordinates"
+
+# The unwrapped heading must close on exactly one full turn: this is what lets
+# the solver spline dir_mid_line across the +/-pi branch cut.
+_turn_psi = float(_tr["dir_mid_line"].values[-1] - _tr["dir_mid_line"].values[0])
+print(f"  heading closure   = {_turn_psi:+.6f} rad   (one closed lap = +/-2*pi)")
+assert abs(abs(_turn_psi) - 2 * np.pi) < 1e-6, "dir_mid_line does not close on one lap"
+
+# The curvature must integrate to the same total turn. This is a midpoint sum,
+# so on a coarse, tight track it carries a real discretisation error (a single
+# segment may turn tens of degrees); the tolerance below is wide enough for
+# that but still catches a wrong sign or a wrong scale.
+_kap_mid = 0.5 * (_tr["curvature"].values[:-1] + _tr["curvature"].values[1:])
+_turn = float(np.sum(_kap_mid * np.diff(_tr["abscissa"].values)))
+print(f"  integral kappa ds = {_turn:+.4f} rad   "
+      f"({100 * abs(_turn / _turn_psi - 1):.2f} % off the heading closure)")
+assert np.sign(_turn) == np.sign(_turn_psi), "curvature has the wrong sign"
+assert abs(_turn / _turn_psi - 1.0) < 0.15, "curvature inconsistent with the geometry"
+
+# --- (c) a duplicated closing point must be dropped -------------------
+# Start from a definitely OPEN track (this reference track may already end on a
+# near-duplicate of its first point), then append an exact copy of the first
+# row: the two must convert to the same table. Keeping the duplicate would
+# leave a zero-length closing segment and a spurious curvature spike there.
+_ref_open = reftrack[:-1] if _was_closed else reftrack
+_tr_open = utils.reftrack_to_mlts_track(_ref_open)
+_tr_dup = utils.reftrack_to_mlts_track(np.vstack([_ref_open, _ref_open[0]]))
+assert len(_tr_dup) == len(_tr_open), (
+    f"duplicated closing point was not dropped: {len(_tr_dup)} vs {len(_tr_open)}")
+assert np.allclose(_tr_dup["abscissa"].values, _tr_open["abscissa"].values), \
+    "dropping the duplicate changed the abscissa"
+assert np.max(np.abs(_tr_dup["curvature"].values)) < 1.0, \
+    "degenerate closing segment produced a spurious curvature spike"
+print(f"  duplicated closing point dropped : OK "
+      f"(max|kappa| = {np.max(np.abs(_tr_dup['curvature'].values)):.4f} 1/m)")
+
+# --- (d)-(f) solve on the OptiLine g-g-v table ------------------------
+# The OCP splines the reference line through the track table, so it needs a
+# finer track than the step=4 subsample used by the geometric stages: that one
+# sits at max|kappa| * spacing = 1.5, where the reference-line spline cuts the
+# corners. Use the full centre line instead (see the resolution note on
+# PointMassOCP), and check that the coarse one does raise the warning.
+_ggv_pm, _axm_pm = import_veh_dyn_info(ggv_import_path=GGV_PATH,
+                                       ax_max_machines_import_path=AX_MAX_PATH)
+
+with warnings.catch_warnings(record=True) as _w_coarse:
+    warnings.simplefilter("always")
+    solvers.PointMassOCP(reftrack, _ggv_pm, w_veh=PM_W_VEH, v_max=PM_V_MAX,
+                         ax_max_machines=_axm_pm, dyn_model_exp=2.0)
+assert any("kappa" in str(_x.message) for _x in _w_coarse), \
+    "a coarse reference track must raise the resolution warning"
+print(f"  coarse track ({reftrack.shape[0]} pts) raises the resolution warning : OK")
+
+_ref_pm = reftrack_full
+_t0 = time.time()
+_pm = solvers.PointMassOCP(_ref_pm, _ggv_pm,
+                           w_veh=PM_W_VEH, v_max=PM_V_MAX,
+                           ax_max_machines=_axm_pm, dyn_model_exp=2.0)
+print(f"  solving on the full centre line: {_ref_pm.shape[0]} pts, "
+      f"max|kappa| * spacing = {_pm.kappa_h:.3f}")
+assert _pm.kappa_h <= 0.5, "the test track is too coarse for this solver"
+# ~1 m nodes, capped so that a long track does not blow up the test runtime
+_pm.solve(mesh=max(1.0, _arc / 1500.0))
+_dt_pm = time.time() - _t0
+print(f"  solved: {_pm.solver_info['status']} in {_pm.solver_info['iterations']} "
+      f"iterations, laptime {_pm.laptime:.3f} s ({_dt_pm:.1f} s wall)")
+assert _pm.solver_info["success"], _pm.solver_info["status"]
+
+# (d) corridor, thinned by half the vehicle width
+_lim = min(_ref_pm[:, 2].min(), _ref_pm[:, 3].min()) - PM_W_VEH / 2.0
+print(f"  max|alpha| = {np.abs(_pm.alpha).max():.4f} m   (corridor limit {_lim:.4f} m)")
+assert np.abs(_pm.alpha).max() <= _lim + 1e-6, "raceline left the thinned corridor"
+
+# (e) the g-g-v envelope is respected to solver tolerance
+_use = _pm.envelope_usage()
+print(f"  envelope: g_max = {_use['g_max']:.6f}, on boundary "
+      f"{100 * _use['frac_on_boundary']:.1f} % of the lap")
+assert _use["g_max"] <= 1.0 + 1e-6, f"solution outside the g-g-v: g = {_use['g_max']}"
+
+# curvature of the returned path must equal ay / V^2 for a point mass
+_k_err = np.abs(_pm.kappa - _pm.ay_profile / _pm.vx_profile ** 2).max()
+assert _k_err < 1e-9, f"kappa_trj != ay / V^2 ({_k_err})"
+
+# (f) curvilinear lap time == time along the returned Cartesian path.
+# This is the check that fails when the track table's abscissa and its own
+# coordinates describe different curves.
+_V = _pm.vx_profile
+_t_cart = float(np.sum(2.0 * _pm.el_lengths / (_V[:-1] + _V[1:])))
+_rel_t = abs(_t_cart - _pm.laptime) / _pm.laptime
+print(f"  laptime {_pm.laptime:.4f} s vs {_t_cart:.4f} s re-integrated on (x, y) "
+      f"-> {abs(_t_cart - _pm.laptime) * 1000:.1f} ms ({100 * _rel_t:.3f} %)")
+# A residual difference remains because the Cartesian path is measured on the
+# mesh polyline, which under-resolves a tight corner; it shrinks with the mesh.
+# An inconsistent track table instead leaves a fixed offset of the order of the
+# ratio between its two length scales (~1 % on the file that motivated this).
+assert _rel_t < 0.003, \
+    f"curvilinear and Cartesian lap times disagree by {100 * _rel_t:.2f} %: " \
+    "the track table's abscissa does not match its own coordinates"
+
+# --- (g) the g-g-v table is converted to valid boundary samples -------
+_samp = solvers.ggv_table_to_mlts_samples(_ggv_pm, ax_max_machines=_axm_pm,
+                                          dyn_model_exp=2.0)
+assert set(_samp) == {"V", "ax", "ay"}
+assert np.all(_samp["ay"] >= 0.0), "boundary samples must use |ay|"
+_n_per_v = np.unique(_samp["V"], return_counts=True)[1]
+assert _n_per_v.min() >= 3, "MLTS needs at least 3 boundary samples per speed"
+print(f"  ggv_table_to_mlts_samples: {len(_samp['V'])} samples over "
+      f"{len(_n_per_v)} speeds : OK")
+
+# --- (h) profiles line up --------------------------------------------
+_s_pm, _vx_pm, _ax_pm, _kap_pm, _tp_pm, _rl_pm = _pm.generate_kinProfs()
+_lens = {len(_s_pm), len(_vx_pm), len(_ax_pm), len(_kap_pm), len(_tp_pm), len(_rl_pm)}
+assert len(_lens) == 1, f"generate_kinProfs returned ragged profiles: {_lens}"
+assert _rl_pm.shape[1] == 2
+print(f"  generate_kinProfs: {len(_s_pm)} points, all profiles aligned : OK")
+
+t_pm = _pm.laptime
+
+print("Stage 13 completed.")
+
+
 # ===========================================================================
 # Summary
 # ===========================================================================
@@ -1420,5 +1628,7 @@ print(f"  BB / ZO  parallel speedup ({N_JOBS_PAR} cores)       : {zo_par_speedup
 print(f"  BB / CMA parallel speedup ({N_JOBS_PAR} cores)       : {cma_par_speedup:.2f}x")
 if t_fb2d_mc is not None:
     print(f"  Stage 10 FBGA fb2d laptime (min-curv)      : {t_fb2d_mc:.2f} s")
+if t_pm is not None:
+    print(f"  Stage 13 PointMassOCP laptime              : {t_pm:.2f} s  (point-mass OCP)")
 print("=" * 60)
 print("All stages completed successfully.")
