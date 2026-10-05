@@ -1,6 +1,6 @@
 [project]
 name = "OptiLine-Py"
-version = "0.2.5"
+version = "0.2.7"
 description = "Raceline optimisation tools"
 authors = [
     {name = "Amir Ali Farzin", email = "amirali77farzin@gmail.com"}
@@ -20,6 +20,8 @@ dependencies = [
     "quadprog>=0.1.13,<0.2",
     "casadi>=3.7,<4",
     "fbga-py>=0.1.0",
+    "MLTS-point-mass>=0.1.0",
+    "numba>=0.59",
 ]
 
 [tool.poetry]
