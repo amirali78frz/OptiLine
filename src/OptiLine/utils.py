@@ -368,8 +368,45 @@ def calc_splines(path: np.ndarray,
     # SOLVE ------------------------------------------------------------------------------------------------------------
     # ------------------------------------------------------------------------------------------------------------------
 
-    x_les = np.squeeze(np.linalg.solve(M, b_x))  # squeeze removes single-dimensional entries
-    y_les = np.squeeze(np.linalg.solve(M, b_y))
+    # M is block-banded -- each cubic couples only to its neighbour -- plus a handful
+    # of corner entries from the closed-loop boundary conditions. A dense solve is
+    # therefore O(n^3) on a matrix that is ~99.8 % zeros, and it was being run TWICE
+    # on the same matrix (once per coordinate). Factorise once, sparsely, and reuse
+    # it for both right-hand sides. Mathematically identical; agrees with the dense
+    # path to ~1e-12. The dense fallback keeps this safe if SciPy's sparse solver is
+    # unavailable or the factorisation fails.
+    #
+    # The triplets are gathered from the two places this function writes to M rather
+    # than by scanning it: csc_matrix(M) has to walk all (4n)^2 entries to find the
+    # ~12n nonzeros, which at 466 nodes costs 13 ms against 0.7 ms for the
+    # factorisation it feeds. Every write above lands either in the 4x8 block band
+    # (rows 4i..4i+3, columns 4i..4i+7) or in the final two boundary rows, which are
+    # scanned in full, so the gather is complete by construction.
+    try:
+        from scipy.sparse import coo_matrix as _coo
+        from scipy.sparse.linalg import splu as _splu
+
+        _m = no_splines * 4
+        _rows_band = np.arange(_m - 2)
+        _cols_band = ((_rows_band // 4) * 4)[:, None] + np.arange(8)[None, :]
+        _in_band = _cols_band < _m
+        _ri = np.broadcast_to(_rows_band[:, None], _cols_band.shape)[_in_band]
+        _ci = _cols_band[_in_band]
+        _vi = M[_ri, _ci]
+
+        _rt, _ct = np.nonzero(M[_m - 2:])                        # the two boundary rows
+        _ri = np.concatenate((_ri, _rt + (_m - 2)))
+        _ci = np.concatenate((_ci, _ct))
+        _vi = np.concatenate((_vi, M[_m - 2:][_rt, _ct]))
+
+        _keep = _vi != 0.0
+        _lu = _splu(_coo((_vi[_keep], (_ri[_keep], _ci[_keep])),
+                         shape=(_m, _m)).tocsc())
+        x_les = np.squeeze(_lu.solve(np.asarray(b_x, dtype=float).ravel()))
+        y_les = np.squeeze(_lu.solve(np.asarray(b_y, dtype=float).ravel()))
+    except Exception:                                            # pragma: no cover
+        x_les = np.squeeze(np.linalg.solve(M, b_x))
+        y_les = np.squeeze(np.linalg.solve(M, b_y))
 
     # get coefficients of every piece into one row -> reshape
     coeffs_x = np.reshape(x_les, (no_splines, 4))
@@ -384,6 +421,9 @@ def calc_splines(path: np.ndarray,
     normvec_normalized = np.expand_dims(norm_factors, axis=1) * normvec
 
     return coeffs_x, coeffs_y, M, normvec_normalized
+
+
+_warned_nonuniform = False       # see create_raceline: warn once, not once per call
 
 
 def create_raceline(refline: np.ndarray,
@@ -457,9 +497,16 @@ def create_raceline(refline: np.ndarray,
     # of the interpolation, but it silently corrupts any velocity profile computed
     # from it. A coarse stepsize_interp may never sample the offending segment, so the
     # problem can stay hidden until the step size is reduced.
+    global _warned_nonuniform
     _sl_min = float(np.min(spline_lengths_raceline))
     _sl_max = float(np.max(spline_lengths_raceline))
-    if _sl_min > 0.0 and _sl_max / _sl_min > 5.0:
+    if _sl_min > 0.0 and _sl_max / _sl_min > 5.0 and not _warned_nonuniform:
+        # Warn ONCE per session. This fires from inside the cost oracle of the
+        # zeroth-order solvers, i.e. once per candidate evaluation -- thousands of
+        # identical messages per run, which drowns the log and costs real time in
+        # the warnings machinery. The condition is a property of the reference
+        # track, so saying it once is enough.
+        _warned_nonuniform = True
         warnings.warn(
             "create_raceline: reference-track node spacing is strongly non-uniform "
             "(longest/shortest spline segment = %.1f; shortest = %.3f m at index %d). "
@@ -743,12 +790,69 @@ def calc_head_curv_an(coeffs_x: np.ndarray,
 
 
 
+def spline_extraction_ops(A: np.ndarray,
+                          no_points: int,
+                          closed: bool = True) -> tuple:
+    """
+    .. description::
+    Return ``(A_inv, T_b, T_c)`` for a spline system matrix ``A``, where
+
+        T_b = A_ex_b @ A_inv        picks the b_i coefficients (first derivative)
+        T_c = A_ex_c @ A_inv        picks 2 * c_i   (second derivative / curvature)
+
+    ``A_ex_b`` and ``A_ex_c`` are the extraction matrices used by the minimum
+    curvature formulation. For a **closed** track each of their rows holds exactly
+    one nonzero -- 1 at column 4i+1 and 2 at column 4i+2 -- so both products are a
+    strided row slice of ``A_inv``, scaled by 1 or by 2. Both factors are powers
+    of two, and the omitted terms of the dot product are exact zeros, so the
+    result is *bitwise* identical to the ``(n x 4n) @ (4n x 4n)`` matmul it
+    replaces while costing O(n^2) instead of O(n^3). At 466 nodes that is ~1.6e9
+    flops and two 7 MB temporaries saved per call.
+
+    The **unclosed** case carries an extra end-of-spline row ([0,1,2,3] and
+    [0,0,2,6]) that mixes four coefficients, so that branch builds the extraction
+    matrices and falls back to the original matmul rather than risk a different
+    summation order.
+
+    Callers that need several of these products should fetch them once here: the
+    inverse is by far the most expensive part, and the minimum curvature path used
+    to form it twice per solve.
+
+    .. inputs::
+    :param A:           spline system matrix from :func:`calc_splines`.
+    :param no_points:   number of reference track points.
+    :param closed:      whether the track is closed.
+
+    .. outputs::
+    :return A_inv:      inverse of A.
+    :return T_b:        A_ex_b @ A_inv.
+    :return T_c:        A_ex_c @ A_inv.
+    """
+    A_inv = np.linalg.inv(A)
+
+    if closed:
+        return A_inv, A_inv[1::4], 2.0 * A_inv[2::4]
+
+    no_splines = no_points - 1
+
+    A_ex_b = np.zeros((no_points, no_splines * 4), dtype=int)
+    A_ex_b[np.arange(no_splines), np.arange(no_splines) * 4 + 1] = 1
+    A_ex_b[-1, -4:] = np.array([0, 1, 2, 3])
+
+    A_ex_c = np.zeros((no_points, no_splines * 4), dtype=int)
+    A_ex_c[np.arange(no_splines), np.arange(no_splines) * 4 + 2] = 2
+    A_ex_c[-1, -4:] = np.array([0, 0, 2, 6])
+
+    return A_inv, np.matmul(A_ex_b, A_inv), np.matmul(A_ex_c, A_inv)
+
+
 def interp_corridor_rows(A: np.ndarray,
                          reftrack: np.ndarray,
                          normvectors: np.ndarray,
                          w_veh: float,
                          closed: bool = True,
-                         n_interp_con: int = 2) -> tuple:
+                         n_interp_con: int = 2,
+                         A_inv: np.ndarray = None) -> tuple:
     """
     .. description::
     Build linear inequality rows that keep the *interpolated* raceline inside the
@@ -776,6 +880,10 @@ def interp_corridor_rows(A: np.ndarray,
     :param n_interp_con:    number of interior points constrained per spline segment.
                             0 disables the extra rows and restores the node-only
                             behaviour; 2 constrains t = 1/3 and t = 2/3.
+    :param A_inv:           inverse of A, if the caller already has it. Inverting A
+                            is the dominant cost here, so a caller that needs it
+                            anyway (the minimum curvature QP does) should pass it
+                            in rather than have it formed a second time.
 
     .. outputs::
     :return G_add:          additional inequality rows (2 * n_interp_con * no_splines, no_points).
@@ -787,7 +895,18 @@ def interp_corridor_rows(A: np.ndarray,
     if n_interp_con < 1:
         return np.zeros((0, no_points)), np.zeros(0)
 
-    A_inv = np.linalg.inv(A)
+    # Only the columns 0::4 and 1::4 of A_inv are ever reached below, because M_x and
+    # M_y are zero in every other row. Restricting the product to them, or solving A
+    # for just those 2n identity columns instead of inverting it, is ~2x and ~1.6x
+    # respectively -- but neither was bitwise exact when measured: OpenBLAS's packed
+    # dgemm kernels order their k-blocks differently for K = 2n than for K = 4n
+    # (1e-16 on 15 % of entries), and LAPACK's triangular solve likewise blocks
+    # differently for 2n right-hand sides. These numbers go into the constraint
+    # matrix of an active-set QP, where a last-bit nudge can change which
+    # constraints are active, so both shortcuts were dropped. Passing A_inv in from
+    # a caller that already has it (H_f does) is the part that is exact.
+    if A_inv is None:
+        A_inv = np.linalg.inv(A)
 
     # M_x / M_y map alpha onto the spline right-hand side (see opt_min_curv)
     M_x = np.zeros((no_splines * 4, no_points))
@@ -910,71 +1029,34 @@ def H_f(reftrack: np.ndarray,
             or A.shape[0] != A.shape[1]:
         raise RuntimeError("Spline equation system matrix A has wrong dimensions!")
 
-    # create extraction matrix -> only b_i coefficients of the solved linear equation system are needed for gradient
-    # information
-    A_ex_b = np.zeros((no_points, no_splines * 4), dtype=int)
-
-    for i in range(no_splines):
-        A_ex_b[i, i * 4 + 1] = 1    # 1 * b_ix = E_x * x
-
-    # coefficients for end of spline (t = 1)
-    if not closed:
-        A_ex_b[-1, -4:] = np.array([0, 1, 2, 3])
-
-    # create extraction matrix -> only c_i coefficients of the solved linear equation system are needed for curvature
-    # information
-    A_ex_c = np.zeros((no_points, no_splines * 4), dtype=int)
-
-    for i in range(no_splines):
-        A_ex_c[i, i * 4 + 2] = 2    # 2 * c_ix = D_x * x
-
-    # coefficients for end of spline (t = 1)
-    if not closed:
-        A_ex_c[-1, -4:] = np.array([0, 0, 2, 6])
-
-    # invert matrix A resulting from the spline setup linear equation system and apply extraction matrix
-    A_inv = np.linalg.inv(A)
-    T_c = np.matmul(A_ex_c, A_inv)
+    # invert A once and extract the b_i / 2*c_i coefficient rows. See
+    # spline_extraction_ops: for a closed track those two products are exact row
+    # slices of A_inv, not matmuls, and A_inv is reused by the corridor rows below
+    # instead of being formed a second time.
+    A_inv, T_b, T_c = spline_extraction_ops(A, no_points, closed=closed)
 
     # set up M_x and M_y matrices including the gradient information, i.e. bring normal vectors into matrix form
     M_x = np.zeros((no_splines * 4, no_points))
     M_y = np.zeros((no_splines * 4, no_points))
 
-    for i in range(no_splines):
-        j = i * 4
+    rows_0 = np.arange(no_splines) * 4
+    rows_1 = rows_0 + 1
+    cols_0 = np.arange(no_splines)
+    cols_1 = np.arange(1, no_splines + 1) % no_points   # wraps to 0 on a closed track
 
-        if i < no_points - 1:
-            M_x[j, i] = normvectors[i, 0]
-            M_x[j + 1, i + 1] = normvectors[i + 1, 0]
-
-            M_y[j, i] = normvectors[i, 1]
-            M_y[j + 1, i + 1] = normvectors[i + 1, 1]
-        else:
-            M_x[j, i] = normvectors[i, 0]
-            M_x[j + 1, 0] = normvectors[0, 0]  # close spline
-
-            M_y[j, i] = normvectors[i, 1]
-            M_y[j + 1, 0] = normvectors[0, 1]
+    M_x[rows_0, cols_0] = normvectors[cols_0, 0]
+    M_x[rows_1, cols_1] = normvectors[cols_1, 0]
+    M_y[rows_0, cols_0] = normvectors[cols_0, 1]
+    M_y[rows_1, cols_1] = normvectors[cols_1, 1]
 
     # set up q_x and q_y matrices including the point coordinate information
     q_x = np.zeros((no_splines * 4, 1))
     q_y = np.zeros((no_splines * 4, 1))
 
-    for i in range(no_splines):
-        j = i * 4
-
-        if i < no_points - 1:
-            q_x[j, 0] = reftrack[i, 0]
-            q_x[j + 1, 0] = reftrack[i + 1, 0]
-
-            q_y[j, 0] = reftrack[i, 1]
-            q_y[j + 1, 0] = reftrack[i + 1, 1]
-        else:
-            q_x[j, 0] = reftrack[i, 0]
-            q_x[j + 1, 0] = reftrack[0, 0]
-
-            q_y[j, 0] = reftrack[i, 1]
-            q_y[j + 1, 0] = reftrack[0, 1]
+    q_x[rows_0, 0] = reftrack[cols_0, 0]
+    q_x[rows_1, 0] = reftrack[cols_1, 0]
+    q_y[rows_0, 0] = reftrack[cols_0, 1]
+    q_y[rows_1, 0] = reftrack[cols_1, 1]
 
     # for unclosed tracks, specify start- and end-heading constraints
     if not closed:
@@ -985,21 +1067,28 @@ def H_f(reftrack: np.ndarray,
         q_y[-1, 0] = math.sin(psi_e + math.pi / 2)
 
     # set up P_xx, P_xy, P_yy matrices
-    x_prime = np.eye(no_points, no_points) * np.matmul(np.matmul(A_ex_b, A_inv), q_x)
-    y_prime = np.eye(no_points, no_points) * np.matmul(np.matmul(A_ex_b, A_inv), q_y)
+    #
+    # x_prime / y_prime are built as np.eye(n) * (n, 1), i.e. they are DIAGONAL --
+    # the code below used to carry them, and everything derived from them (P_xx,
+    # P_yy, P_xy, Q_x, Q_y), as full n x n matrices and multiply them with
+    # np.matmul. Every entry of such a product has a single nonzero term, so
+    # holding the diagonal as a vector and scaling rows gives bitwise identical
+    # numbers while turning ~8 O(n^3) matmuls into O(n) / O(n^2) work.
+    x_prime = np.squeeze(np.matmul(T_b, q_x), axis=1)       # the diagonal of x_prime
+    y_prime = np.squeeze(np.matmul(T_b, q_y), axis=1)
 
     x_prime_sq = np.power(x_prime, 2)
     y_prime_sq = np.power(y_prime, 2)
-    x_prime_y_prime = -2 * np.matmul(x_prime, y_prime)
+    x_prime_y_prime = -2 * (x_prime * y_prime)
 
     curv_den = np.power(x_prime_sq + y_prime_sq, 1.5)                   # calculate curvature denominator
     curv_part = np.divide(1, curv_den, out=np.zeros_like(curv_den),
                           where=curv_den != 0)                          # divide where not zero (diag elements)
     curv_part_sq = np.power(curv_part, 2)
 
-    P_xx = np.matmul(curv_part_sq, y_prime_sq)
-    P_yy = np.matmul(curv_part_sq, x_prime_sq)
-    P_xy = np.matmul(curv_part_sq, x_prime_y_prime)
+    P_xx = curv_part_sq * y_prime_sq
+    P_yy = curv_part_sq * x_prime_sq
+    P_xy = curv_part_sq * x_prime_y_prime
 
     # ------------------------------------------------------------------------------------------------------------------
     # SET UP FINAL MATRICES FOR SOLVER ---------------------------------------------------------------------------------
@@ -1008,27 +1097,37 @@ def H_f(reftrack: np.ndarray,
     T_nx = np.matmul(T_c, M_x)
     T_ny = np.matmul(T_c, M_y)
 
-    H_x = np.matmul(T_nx.T, np.matmul(P_xx, T_nx))
-    H_xy = np.matmul(T_ny.T, np.matmul(P_xy, T_nx))
-    H_y = np.matmul(T_ny.T, np.matmul(P_yy, T_ny))
+    # P_* are diagonal, so these are row scalings; each is also needed twice (once
+    # for H, once for f), so they are formed once here.
+    P_xx_T_nx = P_xx[:, None] * T_nx
+    P_yy_T_ny = P_yy[:, None] * T_ny
+    P_xy_T_nx = P_xy[:, None] * T_nx
+    P_xy_T_ny = P_xy[:, None] * T_ny
+
+    H_x = np.matmul(T_nx.T, P_xx_T_nx)
+    H_xy = np.matmul(T_ny.T, P_xy_T_nx)
+    H_y = np.matmul(T_ny.T, P_yy_T_ny)
     H = H_x + H_xy + H_y
     H = (H + H.T) / 2   # make H symmetric
 
-    f_x = 2 * np.matmul(np.matmul(q_x.T, T_c.T), np.matmul(P_xx, T_nx))
-    f_xy = np.matmul(np.matmul(q_x.T, T_c.T), np.matmul(P_xy, T_ny)) \
-           + np.matmul(np.matmul(q_y.T, T_c.T), np.matmul(P_xy, T_nx))
-    f_y = 2 * np.matmul(np.matmul(q_y.T, T_c.T), np.matmul(P_yy, T_ny))
+    q_x_T_c = np.matmul(q_x.T, T_c.T)
+    q_y_T_c = np.matmul(q_y.T, T_c.T)
+
+    f_x = 2 * np.matmul(q_x_T_c, P_xx_T_nx)
+    f_xy = np.matmul(q_x_T_c, P_xy_T_ny) \
+           + np.matmul(q_y_T_c, P_xy_T_nx)
+    f_y = 2 * np.matmul(q_y_T_c, P_yy_T_ny)
     f = f_x + f_xy + f_y
     f = np.squeeze(f)   # remove non-singleton dimensions
 
-    Q_x = np.matmul(curv_part, y_prime)
-    Q_y = np.matmul(curv_part, x_prime)
+    Q_x = curv_part * y_prime                               # diagonal, as above
+    Q_y = curv_part * x_prime
 
     # this part is multiplied by alpha within the optimization (variable part)
-    E_kappa = np.matmul(Q_y, T_ny) - np.matmul(Q_x, T_nx)
+    E_kappa = Q_y[:, None] * T_ny - Q_x[:, None] * T_nx
 
     # original curvature part (static part)
-    k_kappa_ref = np.matmul(Q_y, np.matmul(T_c, q_y)) - np.matmul(Q_x, np.matmul(T_c, q_x))
+    k_kappa_ref = Q_y[:, None] * np.matmul(T_c, q_y) - Q_x[:, None] * np.matmul(T_c, q_x)
 
     con_ge = np.ones((no_points, 1)) * kappa_bound - k_kappa_ref
     con_le = -(np.ones((no_points, 1)) * -kappa_bound - k_kappa_ref)  # multiplied by -1 as only LE conditions are poss.
@@ -1050,7 +1149,7 @@ def H_f(reftrack: np.ndarray,
     # keep the INTERPOLATED spline inside the corridor as well, not only the nodes
     G_ic, h_ic = interp_corridor_rows(A=A, reftrack=reftrack, normvectors=normvectors,
                                       w_veh=w_veh, closed=closed,
-                                      n_interp_con=n_interp_con)
+                                      n_interp_con=n_interp_con, A_inv=A_inv)
     if G_ic.shape[0] > 0:
         G = np.vstack((G, G_ic))
         h = np.append(h, h_ic)
@@ -1877,3 +1976,479 @@ def reftrack_to_mlts_track(reftrack: np.ndarray,
         "slope":            _closed(slope, 0.0),
         "banking":          _closed(banking, 0.0),
     })
+
+
+# ===========================================================================
+# G-G-V envelope loading
+#
+# A full g-g-v envelope (the JSON form shared by the Trento group) gives the
+# longitudinal limits on a 2-D (v, ay) grid plus a 1-D ay_max(v). FBGA consumes it
+# through three callables, gg_upper(ay, v), gg_lower(ay, v) and gg_range(v), which it
+# evaluates once per segment from C++ -- so they must be fast and picklable (the
+# zeroth-order solvers run them in worker processes).
+#
+# Before v0.2.8 every user had to write that plumbing themselves, which is how two
+# notebooks ended up reconstructing the same envelope differently and disagreeing
+# about whether a solution respected it. load_ggv_envelope() is the single
+# implementation.
+# ===========================================================================
+
+class Bilinear:
+    """f(ay, v) on a uniform (v, ay) grid, with linear extrapolation. Picklable."""
+
+    def __init__(self, v_grid, ay_grid, Z):
+        self.v0 = float(v_grid[0]);  self.dv = float(v_grid[1] - v_grid[0]);  self.nv = len(v_grid)
+        self.a0 = float(ay_grid[0]); self.da = float(ay_grid[1] - ay_grid[0]); self.na = len(ay_grid)
+        self.Z = np.asarray(Z, float).tolist()
+
+    def __call__(self, ay, v):
+        fi = (v - self.v0) / self.dv
+        i = int(math.floor(fi)); i = 0 if i < 0 else (self.nv - 2 if i > self.nv - 2 else i)
+        ti = fi - i
+        fj = (ay - self.a0) / self.da
+        j = int(math.floor(fj)); j = 0 if j < 0 else (self.na - 2 if j > self.na - 2 else j)
+        tj = fj - j
+        r0, r1 = self.Z[i], self.Z[i + 1]
+        return (r0[j] * (1 - ti) * (1 - tj) + r0[j + 1] * (1 - ti) * tj +
+                r1[j] * ti * (1 - tj)       + r1[j + 1] * ti * tj)
+
+    def as_callable(self):
+        """
+        Return a plain closure computing exactly what ``__call__`` computes.
+
+        Fb2d calls these bounds back ~10^5 times per velocity profile, where the
+        bound-method frame and the eight ``self.*`` loads cost more than the
+        arithmetic. Binding them into cell variables is ~1.4x faster per call and
+        bitwise identical -- the expression below is character-for-character the
+        one above. The instance stays the picklable thing that crosses process
+        boundaries to the zeroth-order workers; this is unwrapped on arrival.
+        """
+        v0, dv, a0, da, Z = self.v0, self.dv, self.a0, self.da, self.Z
+        i_hi, j_hi, floor = self.nv - 2, self.na - 2, math.floor
+
+        def f(ay, v):
+            fi = (v - v0) / dv
+            i = int(floor(fi)); i = 0 if i < 0 else (i_hi if i > i_hi else i)
+            ti = fi - i
+            fj = (ay - a0) / da
+            j = int(floor(fj)); j = 0 if j < 0 else (j_hi if j > j_hi else j)
+            tj = fj - j
+            r0 = Z[i]; r1 = Z[i + 1]
+            return (r0[j] * (1 - ti) * (1 - tj) + r0[j + 1] * (1 - ti) * tj +
+                    r1[j] * ti * (1 - tj)       + r1[j + 1] * ti * tj)
+        return f
+
+
+class Linear1D:
+    """f(v) on a uniform v grid, with linear extrapolation. Picklable."""
+
+    def __init__(self, v_grid, y):
+        self.v0 = float(v_grid[0]); self.dv = float(v_grid[1] - v_grid[0]); self.nv = len(v_grid)
+        self.Y = np.asarray(y, float).tolist()
+
+    def __call__(self, v):
+        fi = (v - self.v0) / self.dv
+        i = int(math.floor(fi)); i = 0 if i < 0 else (self.nv - 2 if i > self.nv - 2 else i)
+        t = fi - i
+        return self.Y[i] * (1 - t) + self.Y[i + 1] * t
+
+    def as_callable(self):
+        """Plain closure equivalent of ``__call__``; see :meth:`Bilinear.as_callable`."""
+        v0, dv, Y = self.v0, self.dv, self.Y
+        i_hi, floor = self.nv - 2, math.floor
+
+        def f(v):
+            fi = (v - v0) / dv
+            i = int(floor(fi)); i = 0 if i < 0 else (i_hi if i > i_hi else i)
+            t = fi - i
+            return Y[i] * (1 - t) + Y[i + 1] * t
+        return f
+
+
+def load_ggv_envelope(source,
+                      interp: str = "mlts",
+                      n_v: int = 200,
+                      n_ay: int = 200,
+                      ggv_scales=None) -> dict:
+    """
+
+    .. description::
+    Load a full g-g-v envelope and return everything FBGA and the diagnostics need.
+
+    Two reconstructions of the same data are available, and they are NOT equivalent:
+
+      'mlts' (default)
+          Build the envelope with mlts_point_mass.GGVConstr, then sample its boundary
+          onto a uniform (v, ay) grid for fast lookup. GGVConstr normalises each row
+          onto s = ay / ay_max(v), enforces |ax| non-increasing with ay (which strips
+          solver glitches) and discards speeds where the envelope has collapsed. This
+          is the construction the point-mass OCP is itself constrained with, so a
+          solution produced by that OCP is consistent with these bounds.
+
+      'linear'
+          Bilinear interpolation straight on the tabulated (v, ay) grid. Faithful to
+          the file, but it also reproduces its artefacts: a g-g-v fitted to close at
+          top speed stores ax_min = 0 there, and interpolating into that row removes
+          most of the braking capability over the last few m/s. On the Catalunya
+          envelope the two agree to ~0.01 m/s^2 below 70 m/s and diverge above ~74,
+          which costs a minimum-curvature lap about 0.5 s.
+
+    Returned 'g', available only for 'mlts', is the exact constraint g(ax, ay, V) <= 1.
+    Use it for diagnostics: the gridded callables are an interpolation of the same
+    boundary, so a solution that rides the boundary reads as marginally outside them
+    even when it is exactly feasible.
+
+    .. inputs::
+    :param source:      path to the envelope JSON, or the already-loaded dict.
+    :type source:       str or dict
+    :param interp:      'mlts' (default) or 'linear'.
+    :type interp:       str
+    :param n_v:         speed samples of the lookup grid ('mlts' only).
+    :type n_v:          int
+    :param n_ay:        lateral samples of the lookup grid ('mlts' only).
+    :type n_ay:         int
+    :param ggv_scales:  optional grip scales passed to GGVConstr ('mlts' only).
+    :type ggv_scales:   list or np.ndarray
+
+    .. outputs::
+    :return env:    dict with gg_upper, gg_lower, gg_range, g (None for 'linear'),
+                    v_max, and the raw grids ay_vec, vel_vec, ax_max_grid,
+                    ax_min_grid, vel_vec_lat, ay_max_vec.
+    :rtype env:     dict
+    """
+
+    if isinstance(source, dict):
+        data = source
+    else:
+        import json as _json
+        with open(source, "r") as fh:
+            data = _json.load(fh)
+
+    lon = data["longitudinal_acceleration"]
+    ay_vec = np.array(lon["lateral_acceleration"], float)
+    vel_vec = np.array(lon["longitudinal_velocity"], float)
+    ax_max_grid = np.array(lon["positive_longitudinal_acceleration"], float
+                           ).reshape(len(vel_vec), len(ay_vec))
+    ax_min_grid = np.array(lon["negative_longitudinal_acceleration"], float
+                           ).reshape(len(vel_vec), len(ay_vec))
+    lat = data["lateral_acceleration"]
+    vel_vec_lat = np.array(lat["longitudinal_velocity"], float)
+    ay_max_vec = np.array(lat["positive_lateral_acceleration"], float)
+
+    # v_max always comes from the tabulated speed axis, never from a trimmed grid:
+    # ax_max -> 0 at the top row is the physical definition of the car's top speed.
+    v_max = float(vel_vec.max())
+    gg_range = Linear1D(vel_vec_lat, ay_max_vec)
+    g_exact = None
+
+    if interp == "linear":
+        gg_upper = Bilinear(vel_vec, ay_vec, ax_max_grid)
+        gg_lower = Bilinear(vel_vec, ay_vec, ax_min_grid)
+
+    elif interp == "mlts":
+        try:
+            from mlts_point_mass import GGVConstr
+        except ImportError as exc:                              # pragma: no cover
+            raise ImportError(
+                "interp='mlts' needs the MLTS-point-mass package, which is a "
+                "dependency of OptiLine but is not importable from this interpreter. "
+                "Install it here, or use interp='linear'."
+            ) from exc
+
+        gc = GGVConstr(data, scales=ggv_scales)
+        g_exact = gc.g
+
+        v_grid = np.linspace(max(float(vel_vec.min()), gc.v_min),
+                             min(v_max, gc.v_max), int(n_v))
+        ay_grid = np.linspace(-float(ay_vec.max()), float(ay_vec.max()), int(n_ay))
+        up = np.zeros((len(v_grid), len(ay_grid)))
+        lo = np.zeros_like(up)
+        half = float(ay_grid[1] - ay_grid[0])
+        for i, vv in enumerate(v_grid):
+            b_ay, b_ax = gc.boundary(float(vv), n=1441)         # closed boundary (ay, ax)
+            keep = b_ay >= 0.0
+            A, X = b_ay[keep], b_ax[keep]
+            for j, a in enumerate(np.abs(ay_grid)):
+                m = np.abs(A - a) <= half
+                if m.any():
+                    up[i, j] = X[m].max()
+                    lo[i, j] = X[m].min()
+        gg_upper = Bilinear(v_grid, ay_grid, up)
+        gg_lower = Bilinear(v_grid, ay_grid, lo)
+
+    else:
+        raise ValueError(f"interp must be 'mlts' or 'linear', got {interp!r}")
+
+    return {"gg_upper": gg_upper, "gg_lower": gg_lower, "gg_range": gg_range,
+            "g": g_exact, "v_max": v_max, "interp": interp,
+            "ay_vec": ay_vec, "vel_vec": vel_vec,
+            "ax_max_grid": ax_max_grid, "ax_min_grid": ax_min_grid,
+            "vel_vec_lat": vel_vec_lat, "ay_max_vec": ay_max_vec}
+
+
+# ===========================================================================
+# Reference-track and raceline utilities
+#
+# These were duplicated across the experiment notebooks (seg_bounds and the
+# sub-sampling helper appeared in three of them, in two different variants).
+# ===========================================================================
+
+def seg_bounds(reftrack: np.ndarray, lo: float = 0.8, hi: float = 1.3) -> tuple:
+    """
+
+    .. description::
+    Segment lengths of a CLOSED reference track, plus the spline-length bounds the
+    bilevel optimiser uses. The closing segment (last point -> first point) is
+    included, which is what the spline fit and the solvers assume.
+
+    .. inputs::
+    :param reftrack:    reference track [x, y, w_tr_right, w_tr_left] (unclosed).
+    :param lo:          lower bound as a fraction of the shortest segment.
+    :param hi:          upper bound as a fraction of the longest segment.
+
+    .. outputs::
+    :return min_s:      lower spline-length bound.
+    :return max_s:      upper spline-length bound.
+    :return lengths:    segment lengths including the closing one.
+    """
+    lengths = np.hypot(*np.diff(reftrack[:, :2], axis=0).T)
+    lengths = np.append(lengths, np.hypot(*(reftrack[0, :2] - reftrack[-1, :2])))
+    return lo * lengths.min(), hi * lengths.max(), lengths
+
+
+def subsample_reftrack(reftrack: np.ndarray,
+                       step: int = 1,
+                       mode: str = "arc",
+                       abscissa: np.ndarray = None) -> np.ndarray:
+    """
+
+    .. description::
+    Thin a reference track down to roughly every `step`-th point.
+
+    `mode` decides HOW the nodes are picked, and it matters:
+
+      'arc'    nodes at uniform arc length (default). Use this whenever the track
+               file is sampled non-uniformly -- a track stored at 1 m through the
+               corners and 4 m down the straights yields segments between 7 and 32 m
+               under plain index sub-sampling, and a cubic spline through such a node
+               set curls sharply at the short segments, corrupting the curvature and
+               hence the velocity profile.
+      'index'  every step-th row, the historical behaviour.
+
+    Either way the node COUNT is round(n / step), so `step` keeps its meaning.
+
+    A duplicated closing point is dropped first: keeping it leaves a zero-length
+    closing segment, which is the degenerate case that produces |kappa| spikes.
+
+    .. inputs::
+    :param reftrack:    reference track [x, y, w_tr_right, w_tr_left].
+    :param step:        thinning factor.
+    :param mode:        'arc' or 'index'.
+    :param abscissa:    optional arc length of each row; computed from the chord
+                        polyline when not given ('arc' mode only).
+
+    .. outputs::
+    :return reftrack:   the thinned reference track.
+    """
+    reftrack = np.asarray(reftrack, dtype=float)
+    xy = reftrack[:, :2]
+    spacing = np.median(np.hypot(*np.diff(xy, axis=0).T))
+    if np.hypot(*(xy[-1] - xy[0])) < 0.5 * spacing:
+        reftrack = reftrack[:-1]
+        if abscissa is not None:
+            abscissa = np.asarray(abscissa, float)[:-1]
+        xy = reftrack[:, :2]
+
+    n = max(3, int(round(reftrack.shape[0] / step)))
+
+    if mode == "index":
+        idx = np.unique(np.linspace(0, reftrack.shape[0], n, endpoint=False).astype(int))
+        return reftrack[idx]
+
+    if mode != "arc":
+        raise ValueError(f"mode must be 'arc' or 'index', got {mode!r}")
+
+    if abscissa is None:
+        seg = np.hypot(*np.diff(np.vstack((xy, xy[0])), axis=0).T)
+        abscissa = np.concatenate(([0.0], np.cumsum(seg)[:-1]))
+        total = float(seg.sum())
+    else:
+        abscissa = np.asarray(abscissa, float)
+        total = float(abscissa[-1] + np.hypot(*(xy[0] - xy[-1])))
+
+    s_nodes = np.linspace(0.0, total, n, endpoint=False)
+    return np.column_stack([np.interp(s_nodes, abscissa, reftrack[:, c])
+                            for c in range(reftrack.shape[1])])
+
+
+def raceline_from_alpha(reftrack: np.ndarray,
+                        normvectors: np.ndarray,
+                        alpha: np.ndarray,
+                        stepsize_interp: float = 1.0) -> tuple:
+    """
+
+    .. description::
+    Interpolate the raceline for a vector of lateral shifts and return everything a
+    velocity profiler needs. Wraps create_raceline + calc_head_curv_an, which is the
+    pairing every solver and notebook repeats.
+
+    .. inputs::
+    :param reftrack:        reference track [x, y, w_tr_right, w_tr_left].
+    :param normvectors:     unit normals from calc_splines.
+    :param alpha:           lateral shift per reference point in m.
+    :param stepsize_interp: raceline interpolation step in m.
+
+    .. outputs::
+    :return raceline:   interpolated raceline [x, y].
+    :return kappa:      curvature at every interpolated point in 1/m.
+    :return el_lengths: element lengths between interpolated points in m.
+    """
+    raceline, _, coeffs_x, coeffs_y, spline_inds, t_vals, _, _, el_lengths = \
+        create_raceline(refline=reftrack[:, :2], normvectors=normvectors,
+                        alpha=alpha, stepsize_interp=stepsize_interp)
+    _, kappa = calc_head_curv_an(coeffs_x=coeffs_x, coeffs_y=coeffs_y,
+                                 ind_spls=spline_inds, t_spls=t_vals)
+    return raceline, kappa, el_lengths
+
+
+def track_borders(x_mid, y_mid, dir_mid, width_left, width_right) -> tuple:
+    """
+
+    .. description::
+    Left and right track edges from the mid-line, its heading and the half-widths.
+    The normal is taken positive to the LEFT of the direction of travel, matching the
+    convention of the shared track files (and the opposite of OptiLine's own
+    normvectors, which point right).
+
+    .. outputs::
+    :return left:   (x, y) of the left edge.
+    :return right:  (x, y) of the right edge.
+    """
+    th = np.unwrap(np.asarray(dir_mid, float))
+    nx, ny = -np.sin(th), np.cos(th)
+    x_mid, y_mid = np.asarray(x_mid, float), np.asarray(y_mid, float)
+    wl, wr = np.asarray(width_left, float), np.asarray(width_right, float)
+    return ((x_mid + wl * nx, y_mid + wl * ny), (x_mid - wr * nx, y_mid - wr * ny))
+
+
+# ===========================================================================
+# Projection onto the centreline curvilinear abscissa
+#
+# Comparing racelines needs a common independent coordinate, and each raceline's own
+# travelled arc length is not one: different paths have different lengths, so the
+# curves slide relative to each other by tens of metres over a lap. The centreline
+# abscissa is an objective spatial position, so a given value is the same place on
+# the track for every solution.
+# ===========================================================================
+
+def unwrap_period(v: np.ndarray, period: float) -> np.ndarray:
+    """Make a periodic coordinate increase monotonically over one lap."""
+    v = np.asarray(v, float)
+    d = (np.diff(v) + 0.5 * period) % period - 0.5 * period
+    return np.concatenate([[v[0]], v[0] + np.cumsum(d)])
+
+
+def centreline_frame(x_c, y_c) -> dict:
+    """
+
+    .. description::
+    Pre-process a centreline polyline for repeated point projection. Build this once
+    and reuse it; the KD-tree is what makes project_to_centreline cheap.
+
+    .. inputs::
+    :param x_c:     x of the centreline.
+    :param y_c:     y of the centreline. The loop is closed automatically.
+
+    .. outputs::
+    :return frame:  dict with P, d, seg2, s0, L (lap length) and tree.
+    """
+    P = np.column_stack([np.asarray(x_c, float), np.asarray(y_c, float)])
+    if np.hypot(*(P[0] - P[-1])) > 1e-9:
+        P = np.vstack([P, P[0]])
+    d = np.diff(P, axis=0)
+    seg2 = np.einsum('ij,ij->i', d, d)
+    s0 = np.concatenate([[0.0], np.cumsum(np.sqrt(seg2))])
+    return dict(P=P, d=d, seg2=seg2, s0=s0, L=float(s0[-1]),
+                tree=spatial.cKDTree(P[:-1]))
+
+
+def project_to_centreline(frame: dict, xy: np.ndarray, n_nb: int = 4) -> tuple:
+    """
+
+    .. description::
+    Centreline abscissa and lateral distance of every point of `xy`.
+
+    Each query point is projected onto the nearest of the 2*n_nb+1 centreline
+    segments around its nearest centreline vertex, which is exact for a path that
+    stays inside the corridor.
+
+    .. outputs::
+    :return s_c:    centreline abscissa, unwrapped to increase over the lap.
+    :return dist:   unsigned lateral distance to the centreline in m.
+    """
+    Q = np.asarray(xy, float)
+    _, iv = frame['tree'].query(Q, k=1)
+    ns = len(frame['seg2'])
+    cand = (iv[:, None] + np.arange(-n_nb, n_nb + 1)[None, :]) % ns
+    A = frame['P'][cand]
+    D = frame['d'][cand]
+    W = Q[:, None, :] - A
+    t = np.clip(np.einsum('nkj,nkj->nk', W, D) / frame['seg2'][cand], 0.0, 1.0)
+    E = W - t[..., None] * D
+    dist2 = np.einsum('nkj,nkj->nk', E, E)
+    k = np.argmin(dist2, axis=1)
+    n = np.arange(len(Q))
+    s_c = frame['s0'][cand[n, k]] + t[n, k] * np.sqrt(frame['seg2'][cand[n, k]])
+    return unwrap_period(s_c, frame['L']), np.sqrt(dist2[n, k])
+
+
+def project_signed(frame: dict, xy: np.ndarray, n_nb: int = 4) -> tuple:
+    """
+    As project_to_centreline, but the lateral offset carries a sign: positive to the
+    LEFT of the direction of travel (the ISO convention used by the shared files).
+    """
+    Q = np.asarray(xy, float)
+    s_c, off = project_to_centreline(frame, Q, n_nb=n_nb)
+    _, iv = frame['tree'].query(Q, k=1)
+    t = frame['d'][iv]
+    w = Q - frame['P'][iv]
+    cross = t[:, 0] * w[:, 1] - t[:, 1] * w[:, 0]
+    return s_c, np.where(cross >= 0.0, 1.0, -1.0) * off
+
+
+def smooth_over(y: np.ndarray, x: np.ndarray, win_m: float = 60.0) -> np.ndarray:
+    """Periodic moving average of y over a window of win_m metres of x."""
+    k = max(3, int(round(win_m / max(np.median(np.diff(x)), 1e-9))) | 1)
+    pad = np.r_[y[-(k // 2):], y, y[:k // 2]]
+    return np.convolve(pad, np.ones(k) / k, mode='valid')[:len(y)]
+
+
+def ggv_tables_from_envelope(env: dict) -> tuple:
+    """
+
+    .. description::
+    Minimal point-mass tables taken off a full g-g-v envelope at ay = 0.
+
+    calc_vel_profile_fb2d only consults `ggv` and `ax_max_machines` when gg_upper /
+    gg_lower / gg_range are NOT all supplied (and for a v_max fallback), so with a
+    full envelope in use they are never read -- but several solver signatures still
+    require them. This provides them without pretending to be a faithful projection
+    of the envelope onto a point-mass model.
+
+    For the vanilla profiler (vel_solver='fb') these tables ARE used, together with
+    dyn_model_exp; the result is only as good as an e-superellipse fit of the real
+    envelope, so prefer the fb2d path when a full envelope is available.
+
+    .. inputs::
+    :param env:         envelope dict from load_ggv_envelope.
+
+    .. outputs::
+    :return ggv:        [v, ax_max, ay_max], shape (n, 3).
+    :return ax_max_machines: [v, ax_max_machines], shape (n, 2).
+    """
+    v = env['vel_vec']
+    j0 = int(np.argmin(np.abs(env['ay_vec'])))
+    brake = np.maximum(-env['ax_min_grid'][:, j0], 1e-3)     # tyre longitudinal capacity
+    drive = np.maximum(env['ax_max_grid'][:, j0], 1e-3)      # motor drive limit
+    ay_max = np.maximum(np.interp(v, env['vel_vec_lat'], env['ay_max_vec']), 1e-3)
+    return np.column_stack([v, brake, ay_max]), np.column_stack([v, drive])

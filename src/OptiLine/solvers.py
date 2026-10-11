@@ -93,29 +93,12 @@ def opt_min_curv(reftrack: np.ndarray,
             or A.shape[0] != A.shape[1]:
         raise RuntimeError("Spline equation system matrix A has wrong dimensions!")
 
-    # create extraction matrix -> only b_i coefficients of the solved linear equation system are needed for gradient
-    # information
-    A_ex_b = np.zeros((no_points, no_splines * 4), dtype=int)
-
-    A_ex_b[np.arange(no_splines), np.arange(no_splines) * 4 + 1] = 1    # 1 * b_ix = E_x * x
-
-    # coefficients for end of spline (t = 1)
-    if not closed:
-        A_ex_b[-1, -4:] = np.array([0, 1, 2, 3])
-
-    # create extraction matrix -> only c_i coefficients of the solved linear equation system are needed for curvature
-    # information
-    A_ex_c = np.zeros((no_points, no_splines * 4), dtype=int)
-
-    A_ex_c[np.arange(no_splines), np.arange(no_splines) * 4 + 2] = 2    # 2 * c_ix = D_x * x
-
-    # coefficients for end of spline (t = 1)
-    if not closed:
-        A_ex_c[-1, -4:] = np.array([0, 0, 2, 6])
-
-    # invert matrix A resulting from the spline setup linear equation system and apply extraction matrix
-    A_inv = np.linalg.inv(A)
-    T_c = np.matmul(A_ex_c, A_inv)
+    # Invert A once and extract the b_i (gradient) and 2*c_i (curvature) coefficient
+    # rows. For a closed track utils.spline_extraction_ops returns those as exact
+    # strided row slices of A_inv rather than (n x 4n) @ (4n x 4n) matmuls, and the
+    # single A_inv is reused by the interpolated-corridor rows further down; this
+    # function used to invert A twice and form A_ex_b @ A_inv four separate times.
+    A_inv, T_b, T_c = spline_extraction_ops(A, no_points, closed=closed)
 
     # set up M_x and M_y matrices including the gradient information, i.e. bring normal vectors into matrix form
     M_x = np.zeros((no_splines * 4, no_points))
@@ -149,21 +132,27 @@ def opt_min_curv(reftrack: np.ndarray,
         q_y[-1, 0] = math.sin(psi_e + math.pi / 2)
 
     # set up P_xx, P_xy, P_yy matrices
-    x_prime = np.eye(no_points, no_points) * np.matmul(np.matmul(A_ex_b, A_inv), q_x)
-    y_prime = np.eye(no_points, no_points) * np.matmul(np.matmul(A_ex_b, A_inv), q_y)
+    #
+    # np.eye(n) * (n, 1) is a DIAGONAL matrix, so x_prime / y_prime and everything
+    # derived from them (P_xx, P_yy, P_xy, Q_x, Q_y) only ever carry a diagonal.
+    # Every entry of a product involving them has exactly one nonzero term, so
+    # keeping the diagonal as a vector and scaling rows is bitwise identical to the
+    # np.matmul calls it replaces, at O(n) / O(n^2) instead of O(n^3).
+    x_prime = np.squeeze(np.matmul(T_b, q_x), axis=1)       # the diagonal of x_prime
+    y_prime = np.squeeze(np.matmul(T_b, q_y), axis=1)
 
     x_prime_sq = np.power(x_prime, 2)
     y_prime_sq = np.power(y_prime, 2)
-    x_prime_y_prime = -2 * np.matmul(x_prime, y_prime)
+    x_prime_y_prime = -2 * (x_prime * y_prime)
 
     curv_den = np.power(x_prime_sq + y_prime_sq, 1.5)                   # calculate curvature denominator
     curv_part = np.divide(1, curv_den, out=np.zeros_like(curv_den),
                           where=curv_den != 0)                          # divide where not zero (diag elements)
     curv_part_sq = np.power(curv_part, 2)
 
-    P_xx = np.matmul(curv_part_sq, y_prime_sq)
-    P_yy = np.matmul(curv_part_sq, x_prime_sq)
-    P_xy = np.matmul(curv_part_sq, x_prime_y_prime)
+    P_xx = curv_part_sq * y_prime_sq
+    P_yy = curv_part_sq * x_prime_sq
+    P_xy = curv_part_sq * x_prime_y_prime
 
     # ------------------------------------------------------------------------------------------------------------------
     # SET UP FINAL MATRICES FOR SOLVER ---------------------------------------------------------------------------------
@@ -172,16 +161,25 @@ def opt_min_curv(reftrack: np.ndarray,
     T_nx = np.matmul(T_c, M_x)
     T_ny = np.matmul(T_c, M_y)
 
-    H_x = np.matmul(T_nx.T, np.matmul(P_xx, T_nx))
-    H_xy = np.matmul(T_ny.T, np.matmul(P_xy, T_nx))
-    H_y = np.matmul(T_ny.T, np.matmul(P_yy, T_ny))
+    # diagonal P_*, so row scalings; each is needed twice (H and f), hence hoisted
+    P_xx_T_nx = P_xx[:, None] * T_nx
+    P_yy_T_ny = P_yy[:, None] * T_ny
+    P_xy_T_nx = P_xy[:, None] * T_nx
+    P_xy_T_ny = P_xy[:, None] * T_ny
+
+    H_x = np.matmul(T_nx.T, P_xx_T_nx)
+    H_xy = np.matmul(T_ny.T, P_xy_T_nx)
+    H_y = np.matmul(T_ny.T, P_yy_T_ny)
     H = H_x + H_xy + H_y
     H = (H + H.T) / 2   # make H symmetric
 
-    f_x = 2 * np.matmul(np.matmul(q_x.T, T_c.T), np.matmul(P_xx, T_nx))
-    f_xy = np.matmul(np.matmul(q_x.T, T_c.T), np.matmul(P_xy, T_ny)) \
-           + np.matmul(np.matmul(q_y.T, T_c.T), np.matmul(P_xy, T_nx))
-    f_y = 2 * np.matmul(np.matmul(q_y.T, T_c.T), np.matmul(P_yy, T_ny))
+    q_x_T_c = np.matmul(q_x.T, T_c.T)
+    q_y_T_c = np.matmul(q_y.T, T_c.T)
+
+    f_x = 2 * np.matmul(q_x_T_c, P_xx_T_nx)
+    f_xy = np.matmul(q_x_T_c, P_xy_T_ny) \
+           + np.matmul(q_y_T_c, P_xy_T_nx)
+    f_y = 2 * np.matmul(q_y_T_c, P_yy_T_ny)
     f = f_x + f_xy + f_y
     f = np.squeeze(f)   # remove non-singleton dimensions
 
@@ -189,14 +187,14 @@ def opt_min_curv(reftrack: np.ndarray,
     # KAPPA CONSTRAINTS ------------------------------------------------------------------------------------------------
     # ------------------------------------------------------------------------------------------------------------------
 
-    Q_x = np.matmul(curv_part, y_prime)
-    Q_y = np.matmul(curv_part, x_prime)
+    Q_x = curv_part * y_prime                               # diagonal, as above
+    Q_y = curv_part * x_prime
 
     # this part is multiplied by alpha within the optimization (variable part)
-    E_kappa = np.matmul(Q_y, T_ny) - np.matmul(Q_x, T_nx)
+    E_kappa = Q_y[:, None] * T_ny - Q_x[:, None] * T_nx
 
     # original curvature part (static part)
-    k_kappa_ref = np.matmul(Q_y, np.matmul(T_c, q_y)) - np.matmul(Q_x, np.matmul(T_c, q_x))
+    k_kappa_ref = Q_y[:, None] * np.matmul(T_c, q_y) - Q_x[:, None] * np.matmul(T_c, q_x)
 
     con_ge = np.ones((no_points, 1)) * kappa_bound - k_kappa_ref
     con_le = -(np.ones((no_points, 1)) * -kappa_bound - k_kappa_ref)  # multiplied by -1 as only LE conditions are poss.
@@ -274,7 +272,7 @@ def opt_min_curv(reftrack: np.ndarray,
     # keep the INTERPOLATED spline inside the corridor as well, not only the nodes
     G_ic, h_ic = interp_corridor_rows(A=A, reftrack=reftrack, normvectors=normvectors,
                                       w_veh=w_veh, closed=closed,
-                                      n_interp_con=n_interp_con)
+                                      n_interp_con=n_interp_con, A_inv=A_inv)
     if G_ic.shape[0] > 0:
         G = np.vstack((G, G_ic))
         h = np.append(h, h_ic)
@@ -306,16 +304,15 @@ def opt_min_curv(reftrack: np.ndarray,
     q_x_tmp = q_x + np.matmul(M_x, np.expand_dims(alpha_mincurv, 1))
     q_y_tmp = q_y + np.matmul(M_y, np.expand_dims(alpha_mincurv, 1))
 
-    x_prime_tmp = np.eye(no_points, no_points) * np.matmul(np.matmul(A_ex_b, A_inv), q_x_tmp)
-    y_prime_tmp = np.eye(no_points, no_points) * np.matmul(np.matmul(A_ex_b, A_inv), q_y_tmp)
+    # as above, these are the diagonals; T_b is already A_ex_b @ A_inv
+    xp_tmp_d = np.squeeze(np.matmul(T_b, q_x_tmp), axis=1)
+    yp_tmp_d = np.squeeze(np.matmul(T_b, q_y_tmp), axis=1)
 
     x_prime_prime = np.squeeze(np.matmul(T_c, q_x) + np.matmul(T_nx, np.expand_dims(alpha_mincurv, 1)))
     y_prime_prime = np.squeeze(np.matmul(T_c, q_y) + np.matmul(T_ny, np.expand_dims(alpha_mincurv, 1)))
 
-    xp_d = np.diag(x_prime)
-    yp_d = np.diag(y_prime)
-    xp_tmp_d = np.diag(x_prime_tmp)
-    yp_tmp_d = np.diag(y_prime_tmp)
+    xp_d = x_prime
+    yp_d = y_prime
 
     curv_orig_lin = (xp_d * y_prime_prime - yp_d * x_prime_prime) / np.power(xp_d**2 + yp_d**2, 1.5)
     curv_sol_lin = (xp_tmp_d * y_prime_prime - yp_tmp_d * x_prime_prime) / np.power(xp_tmp_d**2 + yp_tmp_d**2, 1.5)
@@ -596,7 +593,7 @@ class ZORM:
         self.history   = history
         return x
     
-from OptiLine.utils import calc_splines,create_raceline, calc_head_curv_an, H_f, import_veh_dyn_info, interp_corridor_rows, reftrack_to_mlts_track
+from OptiLine.utils import calc_splines,create_raceline, calc_head_curv_an, H_f, import_veh_dyn_info, interp_corridor_rows, reftrack_to_mlts_track, spline_extraction_ops
 from OptiLine.KinematicProfs import calc_vel_profile, calc_vel_profile_solver, calc_ax_profile, calc_t_profile , cumulative_distances
 
 # ---------------------------------------------------------------------------
@@ -1964,7 +1961,16 @@ class Blackbox_raceline:
             vx_profile=vx_cl, el_lengths=el, eq_length_output=False)
         t_prof  = calc_t_profile(
             vx_profile=vx, ax_profile=ax_prof, el_lengths=el)
-        return float(t_prof[-1])
+        t_lap = float(t_prof[-1])
+
+        # A candidate whose velocity profile could not be solved (FBGA reports
+        # "No solution found for segment ..." and leaves NaN behind) must be
+        # REJECTED, not propagated. A NaN cost poisons the zeroth-order gradient
+        # estimate, which then produces a NaN step, and the search silently stops
+        # moving instead of discarding the candidate.
+        if not np.isfinite(t_lap):
+            return float('inf')
+        return t_lap
 
     # ------------------------------------------------------------------
     # Public API
@@ -2853,8 +2859,12 @@ class PointMassOCP:
     0.08 % at 0.8, 0.01 % at 0.4). The attribute `kappa_h` reports the value in use.
 
     .. inputs::
-    :param reftrack:        reference track [x, y, w_tr_right, w_tr_left] in m (unclosed).
-    :type reftrack:         np.ndarray
+    :param reftrack:        reference track [x, y, w_tr_right, w_tr_left] in m
+                            (unclosed), or an already-built track table carrying the
+                            columns abscissa, curvature, dir_mid_line, x_mid_line,
+                            y_mid_line and width_no_kerbs_L/R, which is then used as
+                            given rather than rebuilt from the splines.
+    :type reftrack:         np.ndarray or pandas.DataFrame
     :param ggv:             either the full envelope as a dict with the keys
                             'longitudinal_acceleration' and 'lateral_acceleration',
                             or an OptiLine point-mass table [v, ax_max, ay_max].
@@ -2898,9 +2908,28 @@ class PointMassOCP:
 
         MLTS = _require_mlts()
 
-        self.reftrack = np.asarray(reftrack, dtype=float)
         self.w_veh = float(w_veh)
-        self.track_df = reftrack_to_mlts_track(self.reftrack)
+
+        # `reftrack` is normally an OptiLine reference track, which is converted
+        # here. An already-built track table (anything with the columns that
+        # MLTS-point-mass expects, i.e. a pandas DataFrame as produced by
+        # utils.reftrack_to_mlts_track or read from a shared track file) is taken as
+        # given instead, so that a solution can be reproduced on exactly the track
+        # somebody else used.
+        if hasattr(reftrack, "columns"):
+            _need = ("abscissa", "curvature", "dir_mid_line", "x_mid_line",
+                     "y_mid_line", "width_no_kerbs_L", "width_no_kerbs_R")
+            _missing = [c for c in _need if c not in reftrack.columns]
+            if _missing:
+                raise ValueError(
+                    "track table is missing the column(s) %s; pass either an OptiLine "
+                    "reference track [x, y, w_tr_right, w_tr_left] or a table with %s"
+                    % (", ".join(_missing), ", ".join(_need)))
+            self.reftrack = None
+            self.track_df = reftrack.copy()
+        else:
+            self.reftrack = np.asarray(reftrack, dtype=float)
+            self.track_df = reftrack_to_mlts_track(self.reftrack)
 
         # g-g-v: pass the full envelope straight through, rebuild the boundary from
         # an OptiLine table otherwise
