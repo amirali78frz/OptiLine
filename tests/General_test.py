@@ -1608,6 +1608,264 @@ print("Stage 13 completed.")
 
 
 # ===========================================================================
+print_stage(14, "Shared utilities - envelope, sampling, projection, extraction")
+# ===========================================================================
+# Covers the utils added in 0.2.6-0.2.8, which the experiment notebooks rely on
+# and which had no coverage here. These are mostly EQUIVALENCE checks: each new
+# helper is asserted against the longhand it replaced, so that a future change
+# to one of them cannot silently move a published lap time.
+#
+# What is checked:
+#   (a) _lerp_tables reproduces np.interp bitwise for scalar queries, including
+#       at grid points and outside the grid.
+#   (b) spline_extraction_ops == the explicit A_ex_b/A_ex_c matmuls, closed and
+#       unclosed.
+#   (c) interp_corridor_rows(A_inv=...) == computing the inverse internally.
+#   (d) calc_splines' sparse solve agrees with a dense solve of the same system.
+#   (e) load_ggv_envelope builds usable bounds for both reconstructions, and
+#       as_callable() agrees with __call__ and survives pickling.
+#   (f) fb2d driven by ggv_envelope= equals fb2d driven by the three bounds.
+#   (g) subsample_reftrack modes, seg_bounds, raceline_from_alpha, track_borders,
+#       ggv_tables_from_envelope.
+#   (h) the projection toolkit round-trips a known offset.
+#   (i) create_raceline's non-uniformity warning fires at most once per session.
+#   (j) the blackbox cost oracle rejects a non-finite lap time instead of
+#       propagating NaN into the gradient estimate.
+import pickle as _pickle
+import warnings as _warnings
+from OptiLine import KinematicProfs as _KP
+from OptiLine.KinematicProfs import _lerp_tables as _lt
+
+# --- (a) scalar interpolation is bitwise np.interp ---------------------
+_xp, _fp = ggv[:, 0], ggv[:, 2]
+_xs, _ys, _sl = _lt(_xp, _fp)
+def _lerp(v):
+    if v < _xs[0]:
+        return _ys[0]
+    if v >= _xs[-1]:
+        return _ys[-1]
+    _k = np.searchsorted(_xs, v, side='right') - 1
+    return _sl[_k] * (v - _xs[_k]) + _ys[_k]
+_probe = np.concatenate([_xp, _xp + 1e-13, _xp - 1e-13,
+                         np.linspace(-5.0, _xp[-1] + 5.0, 4001)])
+_bad = [float(v) for v in _probe if _lerp(float(v)) != float(np.interp(v, _xp, _fp))]
+assert not _bad, f"_lerp_tables differs from np.interp at {len(_bad)} points, e.g. {_bad[:3]}"
+print(f"  _lerp_tables == np.interp bitwise over {len(_probe)} probes : OK")
+
+# --- (b) extraction products ------------------------------------------
+def _extract_longhand(A, no_points, closed):
+    ns = no_points if closed else no_points - 1
+    Ai = np.linalg.inv(A)
+    Eb = np.zeros((no_points, ns * 4), dtype=int)
+    Eb[np.arange(ns), np.arange(ns) * 4 + 1] = 1
+    Ec = np.zeros((no_points, ns * 4), dtype=int)
+    Ec[np.arange(ns), np.arange(ns) * 4 + 2] = 2
+    if not closed:
+        Eb[-1, -4:] = np.array([0, 1, 2, 3])
+        Ec[-1, -4:] = np.array([0, 0, 2, 6])
+    return Ai, np.matmul(Eb, Ai), np.matmul(Ec, Ai)
+
+_cl = np.vstack((reftrack[:, :2], reftrack[0, :2]))
+_el = np.hypot(*np.diff(_cl, axis=0).T)
+_, _, _Ac, _nv_c = utils.calc_splines(path=_cl, el_lengths=_el)
+_Ai1, _Tb1, _Tc1 = utils.spline_extraction_ops(_Ac, len(reftrack), closed=True)
+_Ai0, _Tb0, _Tc0 = _extract_longhand(_Ac, len(reftrack), True)
+assert np.array_equal(_Ai1, _Ai0) and np.array_equal(_Tb1, _Tb0) and np.array_equal(_Tc1, _Tc0), \
+    "spline_extraction_ops disagrees with the explicit matmuls (closed)"
+_op = reftrack[:len(reftrack) // 2, :2]
+_eo = np.hypot(*np.diff(_op, axis=0).T)
+_, _, _Au, _ = utils.calc_splines(path=_op, el_lengths=_eo, psi_s=0.0, psi_e=0.4)
+_Ai1u, _Tb1u, _Tc1u = utils.spline_extraction_ops(_Au, len(_op), closed=False)
+_Ai0u, _Tb0u, _Tc0u = _extract_longhand(_Au, len(_op), False)
+assert np.array_equal(_Tb1u, _Tb0u) and np.array_equal(_Tc1u, _Tc0u), \
+    "spline_extraction_ops disagrees with the explicit matmuls (unclosed)"
+print("  spline_extraction_ops == explicit matmuls, closed + unclosed : OK")
+
+# --- (c) sharing the inverse changes nothing --------------------------
+_Gi0, _hi0 = utils.interp_corridor_rows(A=_Ac, reftrack=reftrack, normvectors=_nv_c,
+                                        w_veh=1.0, closed=True, n_interp_con=2)
+_Gi1, _hi1 = utils.interp_corridor_rows(A=_Ac, reftrack=reftrack, normvectors=_nv_c,
+                                        w_veh=1.0, closed=True, n_interp_con=2,
+                                        A_inv=_Ai1)
+assert np.array_equal(_Gi0, _Gi1) and np.array_equal(_hi0, _hi1), \
+    "interp_corridor_rows(A_inv=...) differs from computing the inverse internally"
+print(f"  interp_corridor_rows: A_inv reuse identical ({_Gi0.shape[0]} rows) : OK")
+
+# --- (d) the sparse spline solve agrees with a dense one ---------------
+_cx_s, _cy_s, _M_s, _ = utils.calc_splines(path=_cl, el_lengths=_el)
+_bx = np.zeros((_M_s.shape[0], 1)); _by = np.zeros((_M_s.shape[0], 1))
+_r0 = np.arange(len(reftrack)) * 4
+_bx[_r0, 0] = _cl[:-1, 0]; _bx[_r0 + 1, 0] = _cl[1:, 0]
+_by[_r0, 0] = _cl[:-1, 1]; _by[_r0 + 1, 0] = _cl[1:, 1]
+_cx_d = np.reshape(np.squeeze(np.linalg.solve(_M_s, _bx)), (len(reftrack), 4))
+_cy_d = np.reshape(np.squeeze(np.linalg.solve(_M_s, _by)), (len(reftrack), 4))
+_dsp = max(np.abs(_cx_s - _cx_d).max(), np.abs(_cy_s - _cy_d).max())
+assert _dsp < 1e-9, f"sparse spline solve disagrees with the dense solve by {_dsp:.3e}"
+print(f"  calc_splines sparse vs dense solve : max|diff| = {_dsp:.2e} : OK")
+
+# --- (e) envelope reconstruction + flattened lookups ------------------
+# load_ggv_envelope takes an envelope JSON path or the already-loaded dict, so the
+# ggv table is expanded here into that schema using the package's own ellipse
+# model. Keeping it synthetic makes this stage self-contained: the real envelopes
+# live with the experiments, not in the package.
+_v_env = ggv[:, 0]
+_ay_lim = float(ggv[:, 2].max())
+_ay_env = np.linspace(-_ay_lim, _ay_lim, 41)
+_axp = np.empty((len(_v_env), len(_ay_env)))
+for _iv in range(len(_v_env)):
+    _axm, _aym = float(ggv[_iv, 1]), float(ggv[_iv, 2])
+    _frac = np.clip(np.abs(_ay_env) / _aym, 0.0, 1.0) if _aym > 0 else np.ones_like(_ay_env)
+    _axp[_iv] = _axm * np.sqrt(np.clip(1.0 - _frac ** 2, 0.0, None))
+_env_json = {
+    "longitudinal_acceleration": {
+        "lateral_acceleration": _ay_env.tolist(),
+        "longitudinal_velocity": _v_env.tolist(),
+        "positive_longitudinal_acceleration": _axp.ravel().tolist(),
+        "negative_longitudinal_acceleration": (-_axp).ravel().tolist(),
+    },
+    "lateral_acceleration": {
+        "longitudinal_velocity": _v_env.tolist(),
+        "positive_lateral_acceleration": ggv[:, 2].tolist(),
+    },
+}
+for _mode in ('linear', 'mlts'):
+    _env = utils.load_ggv_envelope(_env_json, interp=_mode)
+    assert {'gg_upper', 'gg_lower', 'gg_range', 'v_max'} <= set(_env), sorted(_env)
+    assert _env['v_max'] > 0
+    for _key in ('gg_upper', 'gg_lower'):
+        _obj = _env[_key]
+        _f = _obj.as_callable()
+        _pairs = [(float(a), float(v)) for a in np.linspace(-14, 14, 25)
+                                       for v in np.linspace(0, _env['v_max'], 13)]
+        assert all(_f(a, v) == _obj(a, v) for a, v in _pairs), \
+            f"{_key}.as_callable() differs from __call__"
+        _rt = _pickle.loads(_pickle.dumps(_obj))   # must survive the ZO workers
+        assert all(_rt(a, v) == _obj(a, v) for a, v in _pairs), f"{_key} broke under pickling"
+    print(f"  load_ggv_envelope(interp='{_mode}'): as_callable + pickle exact : OK")
+
+# --- (f) fb2d via ggv_envelope= equals fb2d via the three bounds -------
+_env_l = utils.load_ggv_envelope(_env_json, interp='linear')
+_kw_fb = dict(kappa=kappa_mc, el_lengths=el_mc, closed=True,
+              drag_coeff=BB_DRAG, m_veh=BB_M)
+_vx_a = _KP.calc_vel_profile_fb2d(
+    gg_upper=_env_l['gg_upper'], gg_lower=_env_l['gg_lower'],
+    gg_range=_env_l['gg_range'], v_max=_env_l['v_max'], **_kw_fb)
+_vx_b = _KP.calc_vel_profile_fb2d(ggv_envelope=_env_l, **_kw_fb)
+assert np.array_equal(_vx_a, _vx_b), "ggv_envelope= differs from passing the bounds directly"
+print(f"  fb2d: ggv_envelope= == explicit bounds ({len(_vx_a)} points) : OK")
+
+# --- (g) sampling and reconstruction helpers --------------------------
+_lo_m, _hi_m, _segs = utils.seg_bounds(reftrack, lo=0.8, hi=1.3)
+assert 0 < _lo_m < _hi_m, (_lo_m, _hi_m)
+assert len(_segs) == len(reftrack), "seg_bounds must include the closing segment"
+assert abs(_segs.sum() - ds_0.sum()) < 1e-9, "seg_bounds lengths disagree with ds_0"
+# 'index' SELECTS rows (every returned row is an original row); 'arc' resamples,
+# so its rows are interpolated and only its spacing can be checked.
+_sub_i = utils.subsample_reftrack(reftrack, step=2, mode='index')
+assert abs(len(_sub_i) - round(len(reftrack) / 2)) <= 1, \
+    f"subsample_reftrack(mode='index') returned {len(_sub_i)} of ~{len(reftrack)//2} rows"
+_rows = {tuple(r) for r in reftrack}
+assert all(tuple(r) in _rows for r in _sub_i), \
+    "subsample_reftrack(mode='index') returned rows that are not original rows"
+assert np.all(np.diff([np.flatnonzero((reftrack[:, 0] == r[0]) &
+                                      (reftrack[:, 1] == r[1]))[0]
+                       for r in _sub_i]) > 0), \
+    "subsample_reftrack(mode='index') did not preserve track order"
+_sub_a = utils.subsample_reftrack(reftrack, step=2, mode='arc')
+_d_a = np.hypot(*np.diff(np.vstack((_sub_a[:, :2], _sub_a[0, :2])), axis=0).T)
+assert _d_a.max() / _d_a.min() < 3.0, \
+    f"subsample_reftrack(mode='arc') left a segment ratio of {_d_a.max()/_d_a.min():.1f}"
+print(f"  seg_bounds [{_lo_m:.2f}, {_hi_m:.2f}] m over {len(_segs)} segments; "
+      f"subsample index/arc ({len(_sub_i)}/{len(_sub_a)} pts, "
+      f"arc ratio {_d_a.max()/_d_a.min():.2f}) : OK")
+
+_a_mc = np.asarray(alpha_mincurv, float)
+_rl_h, _kap_h, _el_h = utils.raceline_from_alpha(reftrack, normvec_norm, _a_mc,
+                                                 stepsize_interp=BB_SI)
+_rl_ref = utils.create_raceline(refline=reftrack[:, :2], normvectors=normvec_norm,
+                                alpha=_a_mc, stepsize_interp=BB_SI)
+assert np.array_equal(_rl_h, _rl_ref[0]), \
+    "raceline_from_alpha differs from create_raceline at the same stepsize"
+assert np.array_equal(_el_h, _rl_ref[8]), "raceline_from_alpha returned other el_lengths"
+assert len(_kap_h) == len(_rl_h), "raceline_from_alpha returned a ragged curvature"
+print(f"  raceline_from_alpha == create_raceline at si={BB_SI} m "
+      f"({len(_rl_h)} points) : OK")
+
+_tr14 = utils.reftrack_to_mlts_track(reftrack)
+(_blx, _bly), (_brx, _bry) = utils.track_borders(
+    _tr14['x_mid_line'].values, _tr14['y_mid_line'].values,
+    _tr14['dir_mid_line'].values,
+    _tr14['width_no_kerbs_L'].values, _tr14['width_no_kerbs_R'].values)
+_wl = np.hypot(_blx - _tr14['x_mid_line'].values, _bly - _tr14['y_mid_line'].values)
+_wr = np.hypot(_brx - _tr14['x_mid_line'].values, _bry - _tr14['y_mid_line'].values)
+assert np.allclose(_wl, _tr14['width_no_kerbs_L'].values, atol=1e-9), "left border offset wrong"
+assert np.allclose(_wr, _tr14['width_no_kerbs_R'].values, atol=1e-9), "right border offset wrong"
+print("  track_borders: both borders at the stated half-widths : OK")
+
+_ggv_r, _axm_r = utils.ggv_tables_from_envelope(_env_l)
+assert _ggv_r.ndim == 2 and _ggv_r.shape[1] == 3 and _axm_r.shape[1] == 2
+assert np.all(np.diff(_ggv_r[:, 0]) > 0), "ggv_tables_from_envelope: speed axis not increasing"
+print(f"  ggv_tables_from_envelope: {_ggv_r.shape[0]}x3 ggv, {_axm_r.shape[0]}x2 machine : OK")
+
+# --- (h) projection round-trip ----------------------------------------
+_frame = utils.centreline_frame(reftrack[:, 0], reftrack[:, 1])
+_off = 0.35
+_pts = utils.raceline_from_alpha(reftrack, normvec_norm,
+                                 np.full(len(reftrack), _off), stepsize_interp=BB_SI)[0]
+_s_pr, _n_pr = utils.project_signed(_frame, _pts)
+# OptiLine's normvectors point to the RIGHT, so a positive alpha is a NEGATIVE
+# signed offset n. Pinning the sign here is what stops the two conventions being
+# silently swapped: alpha = -n.
+assert np.abs(np.median(_n_pr) + _off) < 0.05, \
+    (f"project_signed returned median n = {np.median(_n_pr):+.3f} m for alpha = "
+     f"{_off:+.3f} m; expected {-_off:+.3f} m (alpha = -n)")
+assert np.all(np.isfinite(_s_pr))
+# the station is deliberately UNWRAPPED, so it increases monotonically across the
+# start/finish seam instead of jumping back to zero there
+assert np.all(np.diff(_s_pr) > 0), \
+    "project_signed returned a non-monotonic station: the seam was not unwrapped"
+assert abs((_s_pr.max() - _s_pr.min()) - _frame['L']) < 0.05 * _frame['L'], \
+    (f"project_signed spans {_s_pr.max() - _s_pr.min():.1f} m for a lap of "
+     f"{_frame['L']:.1f} m")
+_w = utils.unwrap_period(np.array([0.1, 0.2, 0.05]), 0.25)
+assert _w[-1] > _w[-2], "unwrap_period did not remove the wrap"
+_sm = utils.smooth_over(np.arange(50.0), np.arange(50.0) * 2.0, win_m=10.0)
+assert len(_sm) == 50 and np.all(np.isfinite(_sm))
+print(f"  projection: {_off} m shift recovered as {np.median(_n_pr):+.3f} m; "
+      "unwrap_period + smooth_over : OK")
+
+# --- (i) the non-uniformity warning fires once ------------------------
+_rt_nu = reftrack.copy()
+_rt_nu[1, 0] += 0.75 * (_rt_nu[1, 0] - _rt_nu[0, 0])   # force a very short segment
+utils._warned_nonuniform = False
+with _warnings.catch_warnings(record=True) as _caught:
+    _warnings.simplefilter("always")
+    for _ in range(12):
+        utils.create_raceline(refline=_rt_nu[:, :2], normvectors=normvec_norm,
+                              alpha=np.zeros(len(_rt_nu)), stepsize_interp=BB_SI)
+_n_nu = sum("non-uniform" in str(_c.message) for _c in _caught)
+assert _n_nu <= 1, f"non-uniformity warning fired {_n_nu} times over 12 calls, expected at most 1"
+print(f"  create_raceline non-uniformity warning: {_n_nu} per 12 calls : OK")
+
+# --- (j) the cost oracle rejects a non-finite lap time ----------------
+_bb14 = solvers.Blackbox_raceline(
+    reftrack=reftrack, ggv=ggv, ax_max_machines=ax_max_machines,
+    sfty=BB_SFTY, v_max=BB_VM, si=BB_SI, m_veh=BB_M, drag_coeff=BB_DRAG,
+    init='mincurv', mu=BB_MU, h=BB_H, iterations=1, seed=0)
+_orig_t = solvers.calc_t_profile
+solvers.calc_t_profile = lambda **kw: np.array([0.0, np.nan])
+try:
+    _c_nan = _bb14._laptime_cost(_bb14.alpha_0)
+finally:
+    solvers.calc_t_profile = _orig_t
+assert _c_nan == float('inf'), f"a NaN lap time was propagated as {_c_nan!r}, expected inf"
+assert np.isfinite(_bb14._laptime_cost(_bb14.alpha_0)), "the guard broke the normal path"
+print("  _laptime_cost: NaN lap time rejected as inf, normal path intact : OK")
+
+print("Stage 14 completed.")
+
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 print("\n" + "=" * 60)
