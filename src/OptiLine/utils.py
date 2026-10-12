@@ -2446,9 +2446,24 @@ def ggv_tables_from_envelope(env: dict) -> tuple:
     :return ggv:        [v, ax_max, ay_max], shape (n, 3).
     :return ax_max_machines: [v, ax_max_machines], shape (n, 2).
     """
-    v = env['vel_vec']
+    v_raw = np.asarray(env['vel_vec'], float)
     j0 = int(np.argmin(np.abs(env['ay_vec'])))
-    brake = np.maximum(-env['ax_min_grid'][:, j0], 1e-3)     # tyre longitudinal capacity
-    drive = np.maximum(env['ax_max_grid'][:, j0], 1e-3)      # motor drive limit
+    brake_raw = np.maximum(-env['ax_min_grid'][:, j0], 1e-3)  # tyre longitudinal capacity
+    drive_raw = np.maximum(env['ax_max_grid'][:, j0], 1e-3)   # motor drive limit
+
+    # The shared envelope files carry a guard row at a NEGATIVE speed (-1 m/s on the
+    # Catalunya envelope) so that a lookup can extrapolate below standstill, and they
+    # have no row at exactly v = 0. import_veh_dyn_info rejects any negative speed
+    # ("ggv seems unreasonable!"), so a table handed to it -- which is what happens
+    # whenever these tables are written out and passed to a solver by path, as
+    # Opt_min_CurvTime requires -- must start at zero. Rows below standstill are
+    # dropped and the v = 0 row is interpolated in when the file lacks one.
+    keep = v_raw >= 0.0
+    v, brake, drive = v_raw[keep], brake_raw[keep], drive_raw[keep]
+    if v.size == 0 or v[0] > 0.0:
+        v = np.concatenate(([0.0], v))
+        brake = np.concatenate(([max(float(np.interp(0.0, v_raw, brake_raw)), 1e-3)], brake))
+        drive = np.concatenate(([max(float(np.interp(0.0, v_raw, drive_raw)), 1e-3)], drive))
+
     ay_max = np.maximum(np.interp(v, env['vel_vec_lat'], env['ay_max_vec']), 1e-3)
     return np.column_stack([v, brake, ay_max]), np.column_stack([v, drive])
