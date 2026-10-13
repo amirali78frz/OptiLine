@@ -547,10 +547,38 @@ def opt_mintime(reftrack: np.ndarray,
 
         # path constraint: safe trajectories with acceleration ellipse
         if pars["optim_opts"]["safe_traj"]:
-            g.append((ca.fmax(axk, 0) / pars["optim_opts"]["ax_pos_safe"]) ** 2
-                     + (ayk / pars["optim_opts"]["ay_safe"]) ** 2)
-            g.append((ca.fmin(axk, 0) / pars["optim_opts"]["ax_neg_safe"]) ** 2
-                     + (ayk / pars["optim_opts"]["ay_safe"]) ** 2)
+            ax_pos_safe = pars["optim_opts"]["ax_pos_safe"]
+            ax_neg_safe = pars["optim_opts"]["ax_neg_safe"]
+            ay_safe = pars["optim_opts"]["ay_safe"]
+
+            # fmax / fmin are NOT differentiable at ax = 0, and on a lap every
+            # brake-to-throttle transition sits exactly there. IPOPT assumes C^1
+            # constraints; against that kink it reaches a primal-feasible point whose
+            # multipliers diverge (~1e13), cannot certify optimality, and exits with
+            # "Restoration Failed" or "local infeasibility" -- which is what stopped
+            # several circuits (Mexico City, Sepang) from solving at all, while others
+            # converged only because their mesh happened to miss the kink.
+            #
+            # These are the standard smooth surrogates, differentiable everywhere:
+            #     max(x, 0) ~ (x + sqrt(x^2 + eps^2)) / 2
+            #     min(x, 0) ~ (x - sqrt(x^2 + eps^2)) / 2
+            # They recover the exact functions as eps -> 0, and in between they are
+            # CONSERVATIVE -- each overshoots the true value by eps/2 at x = 0 -- so
+            # the safe envelope is tightened very slightly, never relaxed. Unlike a
+            # symmetric-only rewrite, this holds for an asymmetric envelope too
+            # (ax_pos_safe != -ax_neg_safe), which is the normal case for a real g-g-v.
+            #
+            # eps defaults to 1 % of the envelope scale, which perturbs the constraint
+            # value by ~(eps / 2 / ax_safe)^2 ~ 2.5e-5. Override with
+            # optim_opts["safe_traj_eps"] if a sharper envelope is needed.
+            eps_safe = pars["optim_opts"].get(
+                "safe_traj_eps", 1e-2 * min(abs(ax_pos_safe), abs(ax_neg_safe)))
+            ax_smooth = ca.sqrt(axk ** 2 + eps_safe ** 2)
+
+            g.append((0.5 * (axk + ax_smooth) / ax_pos_safe) ** 2
+                     + (ayk / ay_safe) ** 2)
+            g.append((0.5 * (axk - ax_smooth) / ax_neg_safe) ** 2
+                     + (ayk / ay_safe) ** 2)
             lbg.append([0.0] * 2)
             ubg.append([1.0] * 2)
 
