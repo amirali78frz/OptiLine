@@ -2587,7 +2587,7 @@ def ShortestPath(reftrack: np.ndarray,
     :type reftrack:                         np.ndarray
     :param w_veh:                           vehicle width in m used to reduce the allowed lateral deviation.
     :type w_veh:                            float
-    :param stepsize:                        interpolation step size for the raceline in m (currently unused internally).
+    :param stepsize:                        interpolation step size for the raceline in m.
     :type stepsize:                         float
     :param v_max:                           maximum velocity in m/s for the velocity profile calculation.
     :type v_max:                            float
@@ -2634,7 +2634,7 @@ def ShortestPath(reftrack: np.ndarray,
     spline_lengths_opt, el_lengths_opt_interp = create_raceline(refline=reftrack[:, :2],
                 normvectors=normvec_norm,
                 alpha=alpha_shpath,
-                stepsize_interp=2.0,)
+                stepsize_interp=stepsize,)
     
 
     psi_vel_opt, kappa_opt =calc_head_curv_an(coeffs_x=coeffs_x_opt,

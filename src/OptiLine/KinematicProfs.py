@@ -427,6 +427,15 @@ def calc_vel_profile_fb2d(kappa: np.ndarray,
     if not closed and v_start is None:
         raise RuntimeError("v_start must be provided for the unclosed case!")
 
+    if v_end is not None:
+        # Fb2d.compute() takes only a start velocity and a speed cap, so a terminal
+        # velocity cannot be imposed through this backend. v_end used to be accepted
+        # and then silently dropped, returning a profile that did not meet the
+        # requested end condition. calc_vel_profile (vel_solver='fb') does honour it.
+        raise RuntimeError(
+            "calc_vel_profile_fb2d cannot impose v_end: the Fb2d backend takes only "
+            "v_start and v_max. Use vel_solver='fb' if a terminal velocity is needed.")
+
     if closed and n_laps % 2 == 0:
         raise RuntimeError("n_laps must be odd so that a well-defined middle lap exists!")
 

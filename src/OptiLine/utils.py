@@ -1137,6 +1137,18 @@ def H_f(reftrack: np.ndarray,
     dev_max_right = reftrack[:, 2] - w_veh / 2
     dev_max_left = reftrack[:, 3] - w_veh / 2
 
+    # constrain the resulting path to the reference line at the start / end point of
+    # an open track. These two flags were previously accepted and silently ignored
+    # here, while opt_min_curv applied them -- so a caller that assembled the QP from
+    # H_f got an unconstrained start/end even after asking to pin it.
+    if not closed and fix_s:
+        dev_max_left[0] = 0.05
+        dev_max_right[0] = 0.05
+
+    if not closed and fix_e:
+        dev_max_left[-1] = 0.05
+        dev_max_right[-1] = 0.05
+
     # check that there is space remaining between left and right maximum deviation (both can be negative as well!)
     if np.any(-dev_max_right > dev_max_left) or np.any(-dev_max_left > dev_max_right):
         raise RuntimeError("Problem not solvable, track might be too small to run with current safety distance!")
