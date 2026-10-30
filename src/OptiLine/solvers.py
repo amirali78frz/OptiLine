@@ -1751,7 +1751,7 @@ class Blackbox_raceline:
         dyn_model_exp: float = 1.0,
         cost_fn=None,
         Projection_fn=None,
-        init: str = 'random',
+        init='random',            # str or array-like of lateral shifts
         oracle: str = 'gaussian',
         mu: float = 0.05,
         h: float = 0.001,
@@ -1849,6 +1849,11 @@ class Blackbox_raceline:
             Solve the minimum-curvature QP (H_f) and use the result as the
             warm-start.  This is the best geometric proxy for lap-time and
             typically the fastest starting point for further ZO/CMA refinement.
+        array-like
+            Any explicit vector of lateral shifts, one per reference-track node,
+            used as the starting point. Clipped into the feasible box. Useful
+            for multi-start studies and for continuing from a solution returned
+            by an earlier run.
         'shortest' (aliases: 'shortest_path', 'sp')
             Solve the Optimal Shortest Path (OSP) QP and use that alpha.
             The shortest path has maximum corner radii (less lateral movement
@@ -1856,6 +1861,17 @@ class Blackbox_raceline:
             tracks where sustained high speed on long straights matters more
             than corner apex curvature.
         """
+        # An explicit starting vector takes precedence over the named modes.
+        if not isinstance(self.init, str):
+            alpha0 = np.asarray(self.init, dtype=float).ravel()
+            if alpha0.size != self.lo.size:
+                raise ValueError(
+                    f"init array has {alpha0.size} entries but the reference "
+                    f"track has {self.lo.size} nodes.")
+            # the search is projected onto the box anyway, so clip rather than
+            # reject a start that sits a rounding error outside it
+            return np.clip(alpha0, self.lo, self.hi)
+
         if self.init == 'random':
             return np.random.uniform(self.lo, self.hi)
         elif self.init == 'zero':
@@ -1896,8 +1912,8 @@ class Blackbox_raceline:
 
         else:
             raise ValueError(
-                f"Unknown init mode '{self.init}'.  "
-                "Use 'random', 'mincurv', or 'shortest'.")
+                f"Unknown init mode '{self.init}'.  Use 'zero', 'random', "
+                "'mincurv', 'shortest', or an array of lateral shifts.")
 
     def _sample_direction(self) -> np.ndarray:
         """Sample a unit-scaled random direction u according to self.oracle."""
@@ -2064,8 +2080,9 @@ class Blackbox_raceline:
         history[0]  = f_start
 
         if verbose:
+            _init_lbl = self.init if isinstance(self.init, str) else 'array'
             print(f"[Blackbox_raceline/{solver}] init  laptime = {f_start:.4f} s"
-                  f"  (init='{self.init}', N={self.N})")
+                  f"  (init='{_init_lbl}', N={self.N})")
 
         # ---- parallel evaluation pool (created once, reused for all iters) ----
         # Three cases depending on n_jobs and cost_fn:
@@ -2318,7 +2335,7 @@ class Blackbox_raceline:
 
         return s, vx, ax, kappa, t_prof, raceline_xy
 
-    def reset_alpha(self, new_init: str = None):
+    def reset_alpha(self, new_init=None):
         """
         Re-initialize alpha_0 (and reset alpha_opt / history).
 
@@ -2327,8 +2344,9 @@ class Blackbox_raceline:
 
         Parameters
         ----------
-        new_init : str or None
-            Override init strategy ('random' or 'mincurv').  None keeps current.
+        new_init : str, array-like or None
+            Override the init strategy, either a named mode or an explicit
+            vector of lateral shifts.  None keeps the current setting.
         """
         if new_init is not None:
             self.init = new_init
